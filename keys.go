@@ -1,7 +1,9 @@
 package verifdocs
 
 import (
+	"bytes"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -18,6 +20,17 @@ const (
 	VerifierECDSA = iota
 	VerifierEDDSA
 )
+
+func (cs VerifierType) String() string {
+	switch cs {
+	case VerifierECDSA:
+		return "VerifierECDSA"
+	case VerifierEDDSA:
+		return "VerifierEDDSA"
+	}
+	return "Unknown verifier type"
+}
+
 
 // Generic interface for something that wraps up the verification key.
 type SigVerifier interface {
@@ -63,6 +76,31 @@ func (v ECDSAVerifier) vtype() VerifierType {
 	return VerifierECDSA
 }
 
+type EDDSAVerifier struct {
+	pubKey ed25519.PublicKey
+}
+
+// verify checks a PureEdDSA (Ed25519) signature over data.
+// data is the concatenation of the SHA-256 proof hash and the SHA-256
+// document hash. Ed25519 applies SHA-512 to that byte string itself.
+func (v EDDSAVerifier) verify(data []byte, sig []byte) (bool, error) {
+	if len(sig) != ed25519.SignatureSize {
+		return false, fmt.Errorf("wrong signature size, got %d bytes exp %d", len(sig), ed25519.SignatureSize)
+	}
+	return ed25519.Verify(v.pubKey, data, sig), nil
+}
+
+// hash is SHA-256, the cryptosuite hash for eddsa-jcs-2022 and eddsa-rdfc-2022.
+// It covers the canonical proof and the canonical document before concatenation.
+func (v EDDSAVerifier) hash(data []byte) []byte {
+	sum := sha256.Sum256(data)
+	return sum[:]
+}
+
+func (v EDDSAVerifier) vtype() VerifierType {
+	return VerifierEDDSA
+}
+
 func VerifierFromMultikey(data string) (SigVerifier, error) {
 	_, decodedBytes, err := multibase.Decode(data)
 	if err != nil {
@@ -76,6 +114,8 @@ func VerifierFromMultikey(data string) (SigVerifier, error) {
 		return ECDSAVerifierFromBytes(elliptic.P384(), decodedBytes[bytesRead:])
 	case 0x1202:
 		return ECDSAVerifierFromBytes(elliptic.P521(), decodedBytes[bytesRead:])
+	case 0xed: // ed25519-pub; the multikey prefix is the varint 0xed01
+		return EDDSAVerifierFromBytes(decodedBytes[bytesRead:])
 	}
 	return nil, fmt.Errorf("unsupported multicodec: %d", codec)
 }
@@ -98,4 +138,11 @@ func ECDSAVerifierFromBytes(curve elliptic.Curve, keyBytes []byte) (*ECDSAVerifi
 	}
 
 	return &ECDSAVerifier{pubKey: pubKey}, nil
+}
+
+func EDDSAVerifierFromBytes(keyBytes []byte) (*EDDSAVerifier, error) {
+	if len(keyBytes) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("Invalid EdDSA public key length, got %d expected %d", len(keyBytes), ed25519.PublicKeySize)
+	}
+	return &EDDSAVerifier{pubKey: bytes.Clone(keyBytes)}, nil
 }

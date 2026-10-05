@@ -287,6 +287,227 @@ func TestVerify_ECDSAJCS_P384(t *testing.T) {
 	}
 }
 
+// eddsa-jcs-2022 vectors from Appendix B.3 of
+// https://w3c.github.io/vc-di-eddsa/#representation-eddsa-jcs-2022
+// The unsigned credential is exCredentialWithoutProof; its canonical form is
+// exCredentialJCSCanon. Only the proof options differ from the P-256 vector.
+const (
+	exEd25519PublicKey = "z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2"
+	exEd25519ProofHash = "66ab154f5c2890a140cb8388a22a160454f80575f6eae09e5a097cabe539a1db"
+	exEd25519DocHash   = "59b7cb6251b8991add1ce0bc83107e3db9dbbab5bd2c28f687db1a03abc92f19"
+	exEd25519Signature = "407cd12654b33d718ecbb99179a1506daaa849450bf3fc523cce3e1c96f8b803" +
+		"51da3f253d725c6f00b07c9e5448d50b3ef78012b9ab54255116d069c6dd2808"
+	exEd25519ProofCanon   = `{"@context":["https://www.w3.org/ns/credentials/v2","https://www.w3.org/ns/credentials/examples/v2"],"created":"2023-02-24T23:36:38Z","cryptosuite":"eddsa-jcs-2022","proofPurpose":"assertionMethod","type":"DataIntegrityProof","verificationMethod":"did:key:z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2#z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2"}`
+	exEd25519ProofOptions = `{
+  "type": "DataIntegrityProof",
+  "cryptosuite": "eddsa-jcs-2022",
+  "created": "2023-02-24T23:36:38Z",
+  "verificationMethod": "did:key:z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2#z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2",
+  "proofPurpose": "assertionMethod",
+  "@context": [
+    "https://www.w3.org/ns/credentials/v2",
+    "https://www.w3.org/ns/credentials/examples/v2"
+  ]
+}`
+	exEd25519Credential = `{
+  "@context": [
+    "https://www.w3.org/ns/credentials/v2",
+    "https://www.w3.org/ns/credentials/examples/v2"
+  ],
+  "id": "urn:uuid:58172aac-d8ba-11ed-83dd-0b3aef56cc33",
+  "type": [
+    "VerifiableCredential",
+    "AlumniCredential"
+  ],
+  "name": "Alumni Credential",
+  "description": "A minimum viable example of an Alumni Credential.",
+  "issuer": "https://vc.example/issuers/5678",
+  "validFrom": "2023-01-01T00:00:00Z",
+  "credentialSubject": {
+    "id": "did:example:abcdefgh",
+    "alumniOf": "The School of Examples"
+  },
+  "proof": {
+    "type": "DataIntegrityProof",
+    "cryptosuite": "eddsa-jcs-2022",
+    "created": "2023-02-24T23:36:38Z",
+    "verificationMethod": "did:key:z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2#z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2",
+    "proofPurpose": "assertionMethod",
+    "@context": [
+      "https://www.w3.org/ns/credentials/v2",
+      "https://www.w3.org/ns/credentials/examples/v2"
+    ],
+    "proofValue": "z2HnFSSPPBzR36zdDgK8PbEHeXbR56YF24jwMpt3R1eHXQzJDMWS93FCzpvJpwTWd3GAVFuUfjoJdcnTMuVor51aX"
+  }
+}`
+)
+
+func TestJCSCanonicalize_EDDSA(t *testing.T) {
+	proofCanon, err := jcs.Transform([]byte(exEd25519ProofOptions))
+	if err != nil {
+		t.Fatalf("canonicalizing proof options: %v", err)
+	}
+	if string(proofCanon) != exEd25519ProofCanon {
+		t.Errorf("canonical proof = %s, want %s", proofCanon, exEd25519ProofCanon)
+	}
+}
+
+func TestJCSHash_EDDSA(t *testing.T) {
+	result, err := JCSHasher(sha256hash).Hash([]byte(exCredentialWithoutProof), []byte(exEd25519ProofOptions))
+	if err != nil {
+		t.Fatalf("Hash: %v", err)
+	}
+	got := hex.EncodeToString(result)
+	if len(got) != len(exEd25519ProofHash)+len(exEd25519DocHash) {
+		t.Fatalf("hash length = %d hex chars, want %d", len(got), len(exEd25519ProofHash)+len(exEd25519DocHash))
+	}
+	if got[:len(exEd25519ProofHash)] != exEd25519ProofHash {
+		t.Errorf("proof hash = %s, want %s", got[:len(exEd25519ProofHash)], exEd25519ProofHash)
+	}
+	if got[len(exEd25519ProofHash):] != exEd25519DocHash {
+		t.Errorf("document hash = %s, want %s", got[len(exEd25519ProofHash):], exEd25519DocHash)
+	}
+}
+
+func TestParseDoc_EDDSAJCS(t *testing.T) {
+	doc := mustParseCredential(t, exEd25519Credential)
+
+	if doc.Proof.CryptoSuite != CryptoSuite_EDDSA_JCS_2022 {
+		t.Errorf("cryptosuite = %s, want eddsa-jcs-2022", doc.Proof.CryptoSuite)
+	}
+	if doc.Proof.ProofType != "DataIntegrityProof" {
+		t.Errorf("proof type = %q, want DataIntegrityProof", doc.Proof.ProofType)
+	}
+	if doc.Proof.ProofPurpose != "assertionMethod" {
+		t.Errorf("proof purpose = %q, want assertionMethod", doc.Proof.ProofPurpose)
+	}
+	if doc.Proof.VerificationMethod.ID != exEd25519PublicKey {
+		t.Errorf("verification method = %s, want %s", doc.Proof.VerificationMethod.ID, exEd25519PublicKey)
+	}
+	if got := hex.EncodeToString(doc.Proof.ProofValue); got != exEd25519Signature {
+		t.Errorf("proof value = %s, want %s", got, exEd25519Signature)
+	}
+	if _, ok := doc.Body["proof"]; ok {
+		t.Error("proof was left in the body")
+	}
+}
+
+func TestGetHash_EDDSAJCS(t *testing.T) {
+	doc := mustParseCredential(t, exEd25519Credential)
+
+	got, err := doc.GetHash(sha256hash)
+	if err != nil {
+		t.Fatalf("GetHash: %v", err)
+	}
+	want := exEd25519ProofHash + exEd25519DocHash
+	if hex.EncodeToString(got) != want {
+		t.Errorf("GetHash = %x, want %s", got, want)
+	}
+}
+
+func TestVerify_EDDSAJCS(t *testing.T) {
+	doc := mustParseCredential(t, exEd25519Credential)
+	verifier := mustVerifier(t, exEd25519PublicKey)
+	if verifier.vtype() != VerifierEDDSA {
+		t.Fatalf("vtype = %v, want EdDSA", verifier.vtype())
+	}
+
+	ok, err := doc.Verify(verifier)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if !ok {
+		t.Fatal("Verify returned false")
+	}
+}
+
+func TestVerify_EDDSAJCS_RejectsTampering(t *testing.T) {
+	verifier := mustVerifier(t, exEd25519PublicKey)
+	tests := []struct {
+		name    string
+		mutate  func(*testing.T, *VerifiableDoc)
+		wantErr string
+	}{
+		{
+			name: "body",
+			mutate: func(_ *testing.T, doc *VerifiableDoc) {
+				doc.Body["name"] = json.RawMessage(`"Tampered"`)
+			},
+		},
+		{
+			name: "proof config",
+			mutate: func(t *testing.T, doc *VerifiableDoc) {
+				const created = "2023-02-24T23:36:38Z"
+				updated := bytes.Replace(doc.RawProof, []byte(created), []byte("2024-02-24T23:36:38Z"), 1)
+				if bytes.Equal(updated, doc.RawProof) {
+					t.Fatalf("proof config has no %s to tamper", created)
+				}
+				doc.RawProof = updated
+			},
+		},
+		{
+			name: "signature",
+			mutate: func(_ *testing.T, doc *VerifiableDoc) {
+				doc.Proof.ProofValue[0] ^= 0x01
+			},
+		},
+		{
+			name:    "signature length",
+			wantErr: "wrong signature size",
+			mutate: func(_ *testing.T, doc *VerifiableDoc) {
+				doc.Proof.ProofValue = doc.Proof.ProofValue[:len(doc.Proof.ProofValue)-1]
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			doc := mustParseCredential(t, exEd25519Credential)
+			tt.mutate(t, &doc)
+			assertVerifyFailed(t, doc, verifier, tt.wantErr)
+		})
+	}
+}
+
+func TestVerify_RejectsVerifierSuiteMismatch(t *testing.T) {
+	const ecdsaP256Key = "zDnaepBuvsQ8cpsWrVKw8fbpGpvPeNSjVPTWoq6cRqaYzBKVP"
+	tests := []struct {
+		name string
+		doc  string
+		key  string
+	}{
+		{name: "eddsa document", doc: exEd25519Credential, key: ecdsaP256Key},
+		{name: "ecdsa document", doc: exFullCredential, key: exEd25519PublicKey},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			doc := mustParseCredential(t, tt.doc)
+			assertVerifyFailed(t, doc, mustVerifier(t, tt.key), "does not match")
+		})
+	}
+}
+
+func TestGetHash_UnsupportedCryptoSuite(t *testing.T) {
+	doc := mustParseCredential(t, ExampleDoc)
+	if doc.Proof.CryptoSuite != CryptoSuite_EDDSA_RDFC_2022 {
+		t.Fatalf("cryptosuite = %s, want eddsa-rdfc-2022", doc.Proof.CryptoSuite)
+	}
+
+	_, err := doc.GetHash(sha256hash)
+	if err == nil {
+		t.Fatal("GetHash succeeded")
+	}
+	if !strings.Contains(err.Error(), "Unsupported hashing") {
+		t.Fatalf("error = %q, want an unsupported hashing error", err)
+	}
+}
+
+func TestVerify_UnsupportedCryptoSuite(t *testing.T) {
+	doc := mustParseCredential(t, ExampleDoc)
+	assertVerifyFailed(t, doc, mustVerifier(t, exEd25519PublicKey), "Unsupported hashing")
+}
+
 func mustParseCredential(t *testing.T, document string) VerifiableDoc {
 	t.Helper()
 	doc, err := ParseDoc([]byte(document))
@@ -294,6 +515,37 @@ func mustParseCredential(t *testing.T, document string) VerifiableDoc {
 		t.Fatalf("ParseDoc: %v", err)
 	}
 	return doc
+}
+
+func mustVerifier(t *testing.T, multikey string) SigVerifier {
+	t.Helper()
+	verifier, err := VerifierFromMultikey(multikey)
+	if err != nil {
+		t.Fatalf("VerifierFromMultikey: %v", err)
+	}
+	return verifier
+}
+
+// wantErr empty means the signature check failed with no error.
+// Otherwise the error text must contain wantErr, and the result must be false.
+func assertVerifyFailed(t *testing.T, doc VerifiableDoc, verifier SigVerifier, wantErr string) {
+	t.Helper()
+	ok, err := doc.Verify(verifier)
+	if ok {
+		t.Fatal("Verify returned true")
+	}
+	if wantErr == "" {
+		if err != nil {
+			t.Fatalf("Verify: %v", err)
+		}
+		return
+	}
+	if err == nil {
+		t.Fatal("Verify returned no error")
+	}
+	if !strings.Contains(err.Error(), wantErr) {
+		t.Fatalf("error = %q, want substring %q", err, wantErr)
+	}
 }
 
 func TestParseVerifDoc(t *testing.T) {
@@ -397,6 +649,10 @@ func TestParseDoc_ProofDoesNotUnmarshal(t *testing.T) {
 		{
 			name:  "created",
 			proof: `{"type":"DataIntegrityProof","proofPurpose":"assertionMethod","created":"yesterday"}`,
+		},
+		{
+			name:  "proof value",
+			proof: `{"type":"DataIntegrityProof","proofPurpose":"assertionMethod","cryptosuite":"eddsa-jcs-2022","proofValue":"not-valid"}`,
 		},
 	}
 	for _, tt := range tests {

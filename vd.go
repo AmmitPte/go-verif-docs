@@ -52,13 +52,23 @@ func ParseCryptoSuite(str string) CryptoSuiteType {
 	}
 }
 
-func (s *CryptoSuiteType) UnmarshalText(text []byte) error {
+func (cs *CryptoSuiteType) UnmarshalText(text []byte) error {
 	parsed := ParseCryptoSuite(string(text))
 	if parsed == CryptoSuite_Unknown {
 		return fmt.Errorf("Unknown crypto suite: %q", string(text))
 	}
-	*s = parsed
+	*cs = parsed
 	return nil
+}
+
+func (cs CryptoSuiteType) MatchesVerifierType(vtype VerifierType)bool {
+	switch cs {
+	case CryptoSuite_ECDSA_JCS_2019, CryptoSuite_ECDSA_RDFC_2019:
+		return vtype == VerifierECDSA
+	case CryptoSuite_EDDSA_JCS_2022, CryptoSuite_EDDSA_RDFC_2022:
+		return vtype == VerifierEDDSA
+	}
+	return false
 }
 
 // Data integrity proof attached to verifiable docs.
@@ -124,9 +134,7 @@ func ParseDoc(data []byte) (VerifiableDoc, error) {
 // Get the hash of the doc appropriate for cryptosuite.
 func (vd VerifiableDoc) GetHash(hashfn func([]byte) []byte) ([]byte, error) {
 	switch vd.Proof.CryptoSuite {
-	case CryptoSuite_ECDSA_JCS_2019:
-		// do nothing
-	case CryptoSuite_EDDSA_JCS_2022:
+	case CryptoSuite_ECDSA_JCS_2019, CryptoSuite_EDDSA_JCS_2022:
 		// do nothing
 	default:
 		return []byte{}, fmt.Errorf("Unsupported hashing for cryptosuite %s", vd.Proof.CryptoSuite)
@@ -189,9 +197,11 @@ func JCSHasher(hashfn func([]byte) []byte) DocHasher {
 	}
 }
 
-// Intetionally leave it to the caller to figure out the key for verification.
+// Intentionally leave it to the caller to figure out the key for verification.
 func (vd VerifiableDoc) Verify(verifier SigVerifier) (bool, error) {
-	// TODO: Should check here that verifier matches cryptosystem.
+	if !vd.Proof.CryptoSuite.MatchesVerifierType(verifier.vtype()) {
+		return false, fmt.Errorf("Verifier type %s does not match cryptosuite %s", verifier.vtype(), vd.Proof.CryptoSuite)
+	}
 	dataHash, err := vd.GetHash(verifier.hash)
 	if err != nil {
 		return false, fmt.Errorf("Error hashing doc: %w", err)

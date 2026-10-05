@@ -2,6 +2,8 @@ package verifdocs
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"strings"
@@ -56,18 +58,32 @@ var ecdsaJCSVectors = []struct {
 	},
 }
 
-// Multicodecs for compressed NIST public keys. See the multiformats table.
+// Multicodecs from the multiformats table.
 const (
-	codecP256 = 0x1200
-	codecP384 = 0x1201
-	codecP521 = 0x1202
+	codecP256    = 0x1200
+	codecP384    = 0x1201
+	codecP521    = 0x1202
+	codecEd25519 = 0xed
+	codecX25519  = 0xec
+)
+
+// eddsa-jcs-2022 vector from Appendix B.3 of
+// https://w3c.github.io/vc-di-eddsa/#representation-eddsa-jcs-2022
+// digest is SHA-256(canonical proof) || SHA-256(canonical document).
+// sig is the raw 64-byte Ed25519 signature over that concatenation.
+const (
+	ed25519PublicKey = "z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2"
+	ed25519Digest    = "66ab154f5c2890a140cb8388a22a160454f80575f6eae09e5a097cabe539a1db" +
+		"59b7cb6251b8991add1ce0bc83107e3db9dbbab5bd2c28f687db1a03abc92f19"
+	ed25519Sig = "407cd12654b33d718ecbb99179a1506daaa849450bf3fc523cce3e1c96f8b803" +
+		"51da3f253d725c6f00b07c9e5448d50b3ef78012b9ab54255116d069c6dd2808"
 )
 
 func TestVerifierFromMultikey_VerifiesKnownDigest(t *testing.T) {
 	for _, vec := range ecdsaJCSVectors {
 		t.Run(vec.name, func(t *testing.T) {
 			t.Parallel()
-			verifier, digest, sig := parseECDSAVector(t, vec.key, vec.digest, vec.sig)
+			verifier, digest, sig := parseMultikeyVector(t, vec.key, vec.digest, vec.sig)
 
 			ok, err := verifier.verify(digest, sig)
 			if err != nil {
@@ -84,7 +100,7 @@ func TestVerifierFromMultikey_RejectsDifferentDigestOrSignature(t *testing.T) {
 	for _, vec := range ecdsaJCSVectors {
 		t.Run(vec.name, func(t *testing.T) {
 			t.Parallel()
-			verifier, digest, sig := parseECDSAVector(t, vec.key, vec.digest, vec.sig)
+			verifier, digest, sig := parseMultikeyVector(t, vec.key, vec.digest, vec.sig)
 
 			t.Run("digest", func(t *testing.T) {
 				tampered := bytes.Clone(digest)
@@ -100,9 +116,105 @@ func TestVerifierFromMultikey_RejectsDifferentDigestOrSignature(t *testing.T) {
 	}
 }
 
+func TestVerifierFromMultikey_Ed25519VerifiesKnownDigest(t *testing.T) {
+	verifier, digest, sig := parseEd25519Vector(t)
+	if verifier.vtype() != VerifierEDDSA {
+		t.Fatalf("vtype = %v, want EdDSA", verifier.vtype())
+	}
+
+	ok, err := verifier.verify(digest, sig)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !ok {
+		t.Fatal("verify returned false for the known digest")
+	}
+}
+
+func TestEDDSAVerifier_HashIsSHA256(t *testing.T) {
+	verifier, _, _ := parseEd25519Vector(t)
+	msg := []byte("canonical-bytes")
+	sum := sha256.Sum256(msg)
+	if !bytes.Equal(verifier.hash(msg), sum[:]) {
+		t.Fatalf("hash = %x, want SHA-256 %x", verifier.hash(msg), sum[:])
+	}
+}
+
+func TestVerifierFromMultikey_Ed25519RejectsDifferentDigestOrSignature(t *testing.T) {
+	verifier, digest, sig := parseEd25519Vector(t)
+
+	t.Run("digest", func(t *testing.T) {
+		tampered := bytes.Clone(digest)
+		tampered[0] ^= 0x01
+		assertVerifyRejected(t, verifier, tampered, sig)
+	})
+	t.Run("signature", func(t *testing.T) {
+		tampered := bytes.Clone(sig)
+		tampered[len(tampered)-1] ^= 0x01
+		assertVerifyRejected(t, verifier, digest, tampered)
+	})
+	t.Run("noncanonical signature", func(t *testing.T) {
+		// RFC 8032 rejects signatures whose final byte has the top bits set.
+		tampered := bytes.Clone(sig)
+		tampered[63] |= 0x80
+		assertVerifyRejected(t, verifier, digest, tampered)
+	})
+}
+
+func TestEDDSAVerifier_WrongSignatureLength(t *testing.T) {
+	verifier, digest, sig := parseEd25519Vector(t)
+	cases := []struct {
+		name string
+		sig  []byte
+	}{
+		{name: "empty", sig: nil},
+		{name: "short", sig: sig[:ed25519.SignatureSize-1]},
+		{name: "long", sig: append(bytes.Clone(sig), 0x00)},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			ok, err := verifier.verify(digest, tt.sig)
+			if ok {
+				t.Fatal("verify returned true")
+			}
+			if err == nil {
+				t.Fatal("expected a signature size error")
+			}
+			if !strings.Contains(err.Error(), "wrong signature size") {
+				t.Fatalf("error = %q, want a signature size error", err)
+			}
+		})
+	}
+}
+
+func TestVerifierFromMultikey_Ed25519RejectsOtherKeys(t *testing.T) {
+	_, digest, sig := parseEd25519Vector(t)
+
+	t.Run("different key", func(t *testing.T) {
+		pub, _, err := ed25519.GenerateKey(bytes.NewReader(bytes.Repeat([]byte{0x07}, ed25519.SeedSize)))
+		if err != nil {
+			t.Fatalf("GenerateKey: %v", err)
+		}
+		verifier, err := VerifierFromMultikey(encodeMultikey(t, codecEd25519, pub))
+		if err != nil {
+			t.Fatalf("VerifierFromMultikey: %v", err)
+		}
+		assertVerifyRejected(t, verifier, digest, sig)
+	})
+	t.Run("off curve", func(t *testing.T) {
+		// 32 0xff bytes is not a canonical edwards25519 point.
+		// Parsing accepts any 32-byte key; verification rejects it.
+		verifier, err := VerifierFromMultikey(encodeMultikey(t, codecEd25519, bytes.Repeat([]byte{0xff}, ed25519.PublicKeySize)))
+		if err != nil {
+			t.Fatalf("VerifierFromMultikey: %v", err)
+		}
+		assertVerifyRejected(t, verifier, digest, sig)
+	})
+}
+
 func TestVerifierFromMultikey_UnknownCodec(t *testing.T) {
-	// 0xed is the ed25519-pub multicodec, which this parser does not accept.
-	key := encodeMultikey(t, 0xed, bytes.Repeat([]byte{0x11}, 32))
+	// x25519-pub is a key-agreement codec, not a signature key.
+	key := encodeMultikey(t, codecX25519, bytes.Repeat([]byte{0x11}, 32))
 	_, err := VerifierFromMultikey(key)
 	if err == nil {
 		t.Fatal("expected an error for an unknown multicodec")
@@ -114,13 +226,14 @@ func TestVerifierFromMultikey_UnknownCodec(t *testing.T) {
 
 func TestVerifierFromMultikey_WrongKeyLength(t *testing.T) {
 	curves := []struct {
-		name           string
-		codec          uint64
-		compressedSize int
+		name    string
+		codec   uint64
+		keySize int
 	}{
 		{"P-256", codecP256, 33},
 		{"P-384", codecP384, 49},
 		{"P-521", codecP521, 67},
+		{"Ed25519", codecEd25519, ed25519.PublicKeySize},
 	}
 	for _, curve := range curves {
 		t.Run(curve.name, func(t *testing.T) {
@@ -131,7 +244,7 @@ func TestVerifierFromMultikey_WrongKeyLength(t *testing.T) {
 					name = "long"
 				}
 				t.Run(name, func(t *testing.T) {
-					keyBytes := bytes.Repeat([]byte{0x02}, curve.compressedSize+delta)
+					keyBytes := bytes.Repeat([]byte{0x02}, curve.keySize+delta)
 					key := encodeMultikey(t, curve.codec, keyBytes)
 					_, err := VerifierFromMultikey(key)
 					if err == nil {
@@ -176,7 +289,19 @@ func TestVerifierFromMultikey_InvalidCurvePoint(t *testing.T) {
 	}
 }
 
-func parseECDSAVector(t *testing.T, key, digestHex, sigHex string) (SigVerifier, []byte, []byte) {
+func TestVerifierFromMultikey_InvalidEncoding(t *testing.T) {
+	_, err := VerifierFromMultikey("not-a-multikey")
+	if err == nil {
+		t.Fatal("expected an error for an invalid multikey")
+	}
+}
+
+func parseEd25519Vector(t *testing.T) (SigVerifier, []byte, []byte) {
+	t.Helper()
+	return parseMultikeyVector(t, ed25519PublicKey, ed25519Digest, ed25519Sig)
+}
+
+func parseMultikeyVector(t *testing.T, key, digestHex, sigHex string) (SigVerifier, []byte, []byte) {
 	t.Helper()
 	verifier, err := VerifierFromMultikey(key)
 	if err != nil {
