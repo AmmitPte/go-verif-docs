@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/binary"
@@ -14,28 +15,27 @@ import (
 	"github.com/multiformats/go-multibase"
 )
 
-type VerifierType int
+type SigType int
 
 const (
-	VerifierECDSA = iota
-	VerifierEDDSA
+	SigType_ECDSA = iota
+	SigType_EDDSA
 )
 
-func (cs VerifierType) String() string {
+func (cs SigType) String() string {
 	switch cs {
-	case VerifierECDSA:
-		return "VerifierECDSA"
-	case VerifierEDDSA:
-		return "VerifierEDDSA"
+	case SigType_ECDSA:
+		return "SigType_ECDSA"
+	case SigType_EDDSA:
+		return "SigType_EDDSA"
 	}
 	return "Unknown verifier type"
 }
 
-
 // Generic interface for something that wraps up the verification key.
 type SigVerifier interface {
 	verify(dataHash []byte, sig []byte) (bool, error)
-	vtype() VerifierType
+	sigType() SigType
 	hash(data []byte) []byte
 }
 
@@ -58,8 +58,8 @@ func (v ECDSAVerifier) verify(data []byte, sig []byte) (bool, error) {
 
 // Hash the document digest with the algorithm paired to the curve by FIPS 186-5:
 // SHA-256 for P-256, SHA-384 for P-384, and SHA-512 for P-521.
-func (v ECDSAVerifier) hash(data []byte) []byte {
-	switch v.pubKey.Curve.Params().BitSize {
+func hashForECDSABitSize(bitSize int, data []byte) []byte {
+	switch bitSize {
 	case 384:
 		sum := sha512.Sum384(data)
 		return sum[:]
@@ -72,8 +72,57 @@ func (v ECDSAVerifier) hash(data []byte) []byte {
 	}
 }
 
-func (v ECDSAVerifier) vtype() VerifierType {
-	return VerifierECDSA
+func (v ECDSAVerifier) hash(data []byte) []byte {
+	return hashForECDSABitSize(v.pubKey.Curve.Params().BitSize, data)
+}
+
+func (v ECDSAVerifier) sigType() SigType {
+	return SigType_ECDSA
+}
+
+// Generic interface for something that wraps up a signing key
+type Signer interface {
+	sign(dataHash []byte) ([]byte, error)
+	sigType() SigType
+	hash(data []byte) []byte
+	verifier() SigVerifier
+}
+
+type ECDSASigner struct {
+	signKey ecdsa.PrivateKey
+}
+
+func GenerateECDSASigner(curve elliptic.Curve) (*ECDSASigner, error) {
+	priv, err := ecdsa.GenerateKey(curve, rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("Error generating ECDSA key: %w", err)
+	}
+	return &ECDSASigner{signKey: *priv}, nil
+}
+
+func (s ECDSASigner) hash(data []byte) []byte {
+	return hashForECDSABitSize(s.signKey.Curve.Params().BitSize, data)
+}
+
+func (s ECDSASigner) sigType() SigType {
+	return SigType_ECDSA
+}
+
+func (signer ECDSASigner) sign(data []byte) ([]byte, error) {
+	digest := signer.hash(data)
+	r, s, err := ecdsa.Sign(rand.Reader, &signer.signKey, digest)
+	if err != nil {
+		return []byte{}, fmt.Errorf("Error signing: %w", err)
+	}
+	keySize := (signer.signKey.Params().BitSize + 7) / 8
+	bytes := make([]byte, 2*keySize)
+	r.FillBytes(bytes[:keySize])
+	s.FillBytes(bytes[keySize:])
+	return bytes, nil
+}
+
+func (s ECDSASigner) verifier() SigVerifier {
+	return ECDSAVerifier{pubKey: &s.signKey.PublicKey}
 }
 
 type EDDSAVerifier struct {
@@ -97,8 +146,8 @@ func (v EDDSAVerifier) hash(data []byte) []byte {
 	return sum[:]
 }
 
-func (v EDDSAVerifier) vtype() VerifierType {
-	return VerifierEDDSA
+func (v EDDSAVerifier) sigType() SigType {
+	return SigType_EDDSA
 }
 
 func VerifierFromMultikey(data string) (SigVerifier, error) {

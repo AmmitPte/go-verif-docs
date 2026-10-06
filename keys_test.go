@@ -2,10 +2,15 @@ package verifdocs
 
 import (
 	"bytes"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/binary"
 	"encoding/hex"
+	"math/big"
 	"strings"
 	"testing"
 
@@ -118,8 +123,8 @@ func TestVerifierFromMultikey_RejectsDifferentDigestOrSignature(t *testing.T) {
 
 func TestVerifierFromMultikey_Ed25519VerifiesKnownDigest(t *testing.T) {
 	verifier, digest, sig := parseEd25519Vector(t)
-	if verifier.vtype() != VerifierEDDSA {
-		t.Fatalf("vtype = %v, want EdDSA", verifier.vtype())
+	if verifier.sigType() != SigType_EDDSA {
+		t.Fatalf("sigType = %v, want EdDSA", verifier.sigType())
 	}
 
 	ok, err := verifier.verify(digest, sig)
@@ -293,6 +298,135 @@ func TestVerifierFromMultikey_InvalidEncoding(t *testing.T) {
 	_, err := VerifierFromMultikey("not-a-multikey")
 	if err == nil {
 		t.Fatal("expected an error for an invalid multikey")
+	}
+}
+
+func TestECDSASigner_SignsWithAllCurves(t *testing.T) {
+	msg := []byte("canonical-bytes")
+	curves := []struct {
+		name   string
+		curve  elliptic.Curve
+		sigLen int
+		hash   func([]byte) []byte
+	}{
+		{
+			name:   "P-256",
+			curve:  elliptic.P256(),
+			sigLen: 64,
+			hash: func(data []byte) []byte {
+				sum := sha256.Sum256(data)
+				return sum[:]
+			},
+		},
+		{
+			name:   "P-384",
+			curve:  elliptic.P384(),
+			sigLen: 96,
+			hash: func(data []byte) []byte {
+				sum := sha512.Sum384(data)
+				return sum[:]
+			},
+		},
+		{
+			name:   "P-521",
+			curve:  elliptic.P521(),
+			sigLen: 132,
+			hash: func(data []byte) []byte {
+				sum := sha512.Sum512(data)
+				return sum[:]
+			},
+		},
+	}
+	for _, curve := range curves {
+		t.Run(curve.name, func(t *testing.T) {
+			t.Parallel()
+			signer, err := GenerateECDSASigner(curve.curve)
+			if err != nil {
+				t.Fatalf("GenerateECDSASigner: %v", err)
+			}
+			if signer.sigType() != SigType_ECDSA {
+				t.Fatalf("sigType = %v, want ECDSA", signer.sigType())
+			}
+
+			digest := curve.hash(msg)
+			if !bytes.Equal(signer.hash(msg), digest) {
+				t.Fatalf("hash = %x, want %x", signer.hash(msg), digest)
+			}
+
+			sig, err := signer.sign(msg)
+			if err != nil {
+				t.Fatalf("sign: %v", err)
+			}
+			if len(sig) != curve.sigLen {
+				t.Fatalf("signature length = %d, want %d", len(sig), curve.sigLen)
+			}
+
+			keySize := curve.sigLen / 2
+			r := new(big.Int).SetBytes(sig[:keySize])
+			s := new(big.Int).SetBytes(sig[keySize:])
+			if !ecdsa.Verify(&signer.signKey.PublicKey, digest, r, s) {
+				t.Fatal("signature did not verify")
+			}
+
+			// Check that the verifier interface works too.
+			b, err := signer.verifier().verify(msg, sig)
+			if err != nil {
+				t.Fatalf("Error verifying sig: %s", err)
+			}
+			if !b {
+				t.Fatal("Verifier failed to verify sig")
+			}
+
+			tampered := bytes.Clone(msg)
+			tampered[0] ^= 0x01
+			if ecdsa.Verify(&signer.signKey.PublicKey, curve.hash(tampered), r, s) {
+				t.Fatal("signature verified a different message")
+			}
+
+			b, err = signer.verifier().verify(tampered, sig)
+			if err != nil {
+				t.Fatalf("Error verifying tampered sig: %s", err)
+			}
+			if b {
+				t.Fatal("Verifier verified a different message")
+			}
+		})
+	}
+}
+
+func TestECDSASigner_InvalidSigningKey(t *testing.T) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	// crypto/ecdsa rejects a scalar that is outside 1..N-1.
+	orderBits := uint(priv.Params().N.BitLen())
+	cases := []struct {
+		name string
+		d    *big.Int
+	}{
+		{name: "zero", d: big.NewInt(0)},
+		{name: "negative", d: big.NewInt(-1)},
+		{name: "too large", d: new(big.Int).Lsh(big.NewInt(1), orderBits)},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			key := *priv
+			key.D = tt.d
+			signer := ECDSASigner{signKey: key}
+
+			sig, err := signer.sign([]byte("canonical-bytes"))
+			if err == nil {
+				t.Fatal("expected an error for an invalid signing key")
+			}
+			if len(sig) != 0 {
+				t.Fatalf("signature = %x, want none", sig)
+			}
+			if !strings.Contains(err.Error(), "Error signing") || !strings.Contains(err.Error(), "private key scalar") {
+				t.Fatalf("error = %q, want a signing error for an invalid scalar", err)
+			}
+		})
 	}
 }
 

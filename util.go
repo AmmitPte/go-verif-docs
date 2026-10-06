@@ -55,3 +55,11 @@ func (m *MultibaseBytes) UnmarshalJSON(data []byte) error {
 	*m = decodedBytes
 	return nil
 }
+
+func (m MultibaseBytes) MarshalJSON() ([]byte, error) {
+	str, err := multibase.Encode(multibase.Base58BTC, m)
+	if err != nil {
+		return []byte{}, fmt.Errorf("failed to encode multibase string: %w", err)
+	}
+	return json.Marshal(str)
+}

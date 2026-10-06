@@ -2,15 +2,20 @@ package verifdocs
 
 import (
 	"bytes"
+	"crypto/elliptic"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"math"
+	"math/big"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gowebpki/jcs"
+	"github.com/nuts-foundation/go-did/did"
 )
 
 const ExampleDoc = `{
@@ -387,7 +392,7 @@ func TestParseDoc_EDDSAJCS(t *testing.T) {
 	if got := hex.EncodeToString(doc.Proof.ProofValue); got != exEd25519Signature {
 		t.Errorf("proof value = %s, want %s", got, exEd25519Signature)
 	}
-	if _, ok := doc.Body["proof"]; ok {
+	if bytes.Contains(doc.Body, []byte(`"proof"`)) {
 		t.Error("proof was left in the body")
 	}
 }
@@ -408,8 +413,8 @@ func TestGetHash_EDDSAJCS(t *testing.T) {
 func TestVerify_EDDSAJCS(t *testing.T) {
 	doc := mustParseCredential(t, exEd25519Credential)
 	verifier := mustVerifier(t, exEd25519PublicKey)
-	if verifier.vtype() != VerifierEDDSA {
-		t.Fatalf("vtype = %v, want EdDSA", verifier.vtype())
+	if verifier.sigType() != SigType_EDDSA {
+		t.Fatalf("sigType = %v, want EdDSA", verifier.sigType())
 	}
 
 	ok, err := doc.Verify(verifier)
@@ -430,19 +435,24 @@ func TestVerify_EDDSAJCS_RejectsTampering(t *testing.T) {
 	}{
 		{
 			name: "body",
-			mutate: func(_ *testing.T, doc *VerifiableDoc) {
-				doc.Body["name"] = json.RawMessage(`"Tampered"`)
+			mutate: func(t *testing.T, doc *VerifiableDoc) {
+				const name = `"Alumni Credential"`
+				updated := bytes.Replace(doc.Body, []byte(name), []byte(`"Tampered"`), 1)
+				if bytes.Equal(updated, doc.Body) {
+					t.Fatalf("body has no %s to tamper", name)
+				}
+				doc.Body = updated
 			},
 		},
 		{
 			name: "proof config",
 			mutate: func(t *testing.T, doc *VerifiableDoc) {
 				const created = "2023-02-24T23:36:38Z"
-				updated := bytes.Replace(doc.RawProof, []byte(created), []byte("2024-02-24T23:36:38Z"), 1)
-				if bytes.Equal(updated, doc.RawProof) {
+				updated := bytes.Replace(doc.rawProofOptions, []byte(created), []byte("2024-02-24T23:36:38Z"), 1)
+				if bytes.Equal(updated, doc.rawProofOptions) {
 					t.Fatalf("proof config has no %s to tamper", created)
 				}
-				doc.RawProof = updated
+				doc.rawProofOptions = updated
 			},
 		},
 		{
@@ -555,26 +565,18 @@ func TestParseVerifDoc(t *testing.T) {
 		return
 	}
 
-	bodyBytes, _ := json.Marshal(doc.Body)
-	bodyJCS, err := jcs.Transform(bodyBytes)
+	bodyJCS, err := jcs.Transform(doc.Body)
 	if err != nil {
 		t.Errorf("Error canonicalizing body: %s", err)
 	} else if string(bodyJCS) != exCredentialJCSCanon {
 		t.Errorf("Body does not match expected:\nGot %s\nExpected %s", string(bodyJCS), exCredentialJCSCanon)
 	}
 
-	// have to remove proof value from raw proof
-	var proof map[string]json.RawMessage
-	if err := json.Unmarshal(doc.RawProof, &proof); err != nil {
-		t.Errorf("Error parsing raw proof: %s", err)
-	}
-	delete(proof, "proofValue")
-	proofBytes, _ := json.Marshal(proof)
-	proofJCS, err := jcs.Transform(proofBytes)
+	proofJCS, err := jcs.Transform(doc.rawProofOptions)
 	if err != nil {
 		t.Errorf("Error canonicalizing proof: %s", err)
 	} else if string(proofJCS) != exProofJCSCanon {
-		t.Errorf("Proof does not match expected:\nGot %s\nExpected %s", string(bodyJCS), exCredentialJCSCanon)
+		t.Errorf("Proof does not match expected:\nGot %s\nExpected %s", string(proofJCS), exProofJCSCanon)
 	}
 
 	if doc.Proof.ProofType != "DataIntegrityProof" {
@@ -620,7 +622,11 @@ func TestParseDoc_MalformedNonProofField(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseDoc: %v", err)
 	}
-	got, ok := doc.Body["credentialSubject"]
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(doc.Body, &body); err != nil {
+		t.Fatalf("body: %v", err)
+	}
+	got, ok := body["credentialSubject"]
 	if !ok {
 		t.Fatal("credentialSubject was dropped")
 	}
@@ -628,7 +634,7 @@ func TestParseDoc_MalformedNonProofField(t *testing.T) {
 	if string(got) != want {
 		t.Errorf("credentialSubject = %s, want %s", got, want)
 	}
-	if _, ok := doc.Body["proof"]; ok {
+	if _, ok := body["proof"]; ok {
 		t.Error("proof was left in the body")
 	}
 	if doc.Proof.ProofType != "DataIntegrityProof" || doc.Proof.ProofPurpose != "assertionMethod" {
@@ -736,6 +742,415 @@ func TestVerifDocVerify(t *testing.T) {
 		t.Errorf("Doc verification failed.")
 	}
 }
+
+func TestMakeVerifDoc(t *testing.T) {
+	baseDoc := struct {
+		ID   int    `json:"id"`
+		Name string `json:"name"`
+	}{
+		ID:   101,
+		Name: "Alice",
+	}
+	const didString = "did:web:example.com:user:101#key-1"
+	didUrl := did.MustParseDIDURL(didString)
+	vd, err := MakeVerifiableDoc(baseDoc, CryptoSuite_ECDSA_JCS_2019, &didUrl)
+	if err != nil {
+		t.Fatalf("Error making verifiable doc: %s", err)
+	}
+	if vd.Proof.ProofType != "DataIntegrityProof" {
+		t.Errorf("Proof type does not match expected, got %s, want %s", vd.Proof.ProofType, "DataIntegrityProof")
+	}
+	if vd.Proof.ProofPurpose != "assertionMethod" {
+		t.Errorf("Proof purpose does not match expected, got %s, want %s", vd.Proof.ProofPurpose, "assertionMethod")
+	}
+	if vd.Proof.CryptoSuite != CryptoSuite_ECDSA_JCS_2019 {
+		t.Errorf("Crypto suite does not match expected, got %s, want %s", vd.Proof.CryptoSuite, "CryptoSuite_ECDSA_JCS_2019")
+	}
+	if vd.Proof.VerificationMethod.String() != didString {
+		t.Errorf("Verification method does not match expected, got %s, want %s", vd.Proof.VerificationMethod, didString)
+	}
+	expBodyJCS, _ := jcs.Transform([]byte(`{"id":101,"name": "Alice"}`))
+	resBodyJCS, _ := jcs.Transform(vd.Body)
+	if string(resBodyJCS) != string(expBodyJCS) {
+		t.Errorf("Body doe not match expected.\nGot: %s\nExp: %s", string(resBodyJCS), string(expBodyJCS))
+	}
+}
+
+func TestSignVerifDoc(t *testing.T) {
+	baseDoc := struct {
+		ID   int    `json:"id"`
+		Name string `json:"name"`
+	}{
+		ID:   101,
+		Name: "Alice",
+	}
+	const didString = "did:web:example.com:user:101#key-1"
+	didUrl := did.MustParseDIDURL(didString)
+	vd, err := MakeVerifiableDoc(baseDoc, CryptoSuite_ECDSA_JCS_2019, &didUrl)
+	if err != nil {
+		t.Fatalf("Error making verifiable doc: %s", err)
+	}
+	signer, err := GenerateECDSASigner(elliptic.P256())
+	if err != nil {
+		t.Fatalf("Error generating ECDSA signer: %s", err)
+	}
+	signedDoc, err := vd.Sign(signer)
+	if err != nil {
+		t.Fatalf("Error signing verifiable doc: %s", err)
+	}
+
+	vd2, err := ParseDoc(signedDoc)
+	if err != nil {
+		t.Fatalf("Error parsing signed doc: %s", err)
+	}
+	b, err := vd2.Verify(signer.verifier())
+	if err != nil {
+		t.Errorf("Error verifying signed doc: %s", err)
+	}
+	if !b {
+		t.Error("Signed doc failed to verify.")
+	}
+}
+
+// Make's only error is json.Marshal of the document. These are the values
+// that call can refuse: unsupported types, non-finite floats, cycles,
+// a MarshalJSON method that returns an error, and raw JSON that is not valid.
+func TestMake_RejectsUnmarshalableDoc(t *testing.T) {
+	type cycle struct {
+		Self *cycle `json:"self"`
+	}
+	loop := &cycle{}
+	loop.Self = loop
+
+	tests := []struct {
+		name string
+		doc  any
+		want string
+	}{
+		{name: "channel", doc: make(chan int), want: "unsupported type: chan int"},
+		{name: "function", doc: func() {}, want: "unsupported type: func()"},
+		{name: "complex", doc: complex(1, 2), want: "unsupported type: complex128"},
+		{name: "map key", doc: map[struct{ N int }]string{{}: "x"}, want: "object member name must be a string"},
+		{name: "NaN", doc: math.NaN(), want: "unsupported value: NaN"},
+		{name: "+Inf", doc: math.Inf(1), want: "unsupported value: +Inf"},
+		{name: "-Inf", doc: math.Inf(-1), want: "unsupported value: -Inf"},
+		{name: "cycle", doc: loop, want: "encountered a cycle"},
+		{name: "marshal error", doc: refuseJSON{}, want: "refuse to marshal"},
+		{name: "truncated raw json", doc: json.RawMessage(`{"id":`), want: "unexpected end of JSON input"},
+		{name: "trailing junk", doc: json.RawMessage(`{"id":1}x`), want: "invalid character"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			requireMakeError(t, tt.doc, tt.want)
+		})
+	}
+}
+
+// Sign rejects a signer whose signature type does not match the cryptosuite.
+// An unknown suite matches neither ECDSA nor EdDSA.
+func TestSign_RejectsSuiteMismatch(t *testing.T) {
+	ecdsaSigner := mustECDSASigner(t)
+	tests := []struct {
+		name   string
+		suite  CryptoSuiteType
+		signer Signer
+		want   string
+	}{
+		{
+			name:   "ecdsa signer with eddsa-jcs-2022",
+			suite:  CryptoSuite_EDDSA_JCS_2022,
+			signer: ecdsaSigner,
+			want:   "SigType_ECDSA does not match cryptosuite eddsa-jcs-2022",
+		},
+		{
+			name:   "ecdsa signer with eddsa-rdfc-2022",
+			suite:  CryptoSuite_EDDSA_RDFC_2022,
+			signer: ecdsaSigner,
+			want:   "SigType_ECDSA does not match cryptosuite eddsa-rdfc-2022",
+		},
+		{
+			name:   "ecdsa signer with unknown suite",
+			suite:  CryptoSuite_Unknown,
+			signer: ecdsaSigner,
+			want:   "SigType_ECDSA does not match cryptosuite Unknown crypto suite",
+		},
+		{
+			name:   "eddsa signer with ecdsa-jcs-2019",
+			suite:  CryptoSuite_ECDSA_JCS_2019,
+			signer: stubSigner{kind: SigType_EDDSA},
+			want:   "SigType_EDDSA does not match cryptosuite ecdsa-jcs-2019",
+		},
+		{
+			name:   "eddsa signer with ecdsa-rdfc-2019",
+			suite:  CryptoSuite_ECDSA_RDFC_2019,
+			signer: stubSigner{kind: SigType_EDDSA},
+			want:   "SigType_EDDSA does not match cryptosuite ecdsa-rdfc-2019",
+		},
+		{
+			name:   "unknown signer type",
+			suite:  CryptoSuite_ECDSA_JCS_2019,
+			signer: stubSigner{kind: SigType(99)},
+			want:   "Unknown verifier type does not match cryptosuite ecdsa-jcs-2019",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			vd := mustMakeVerifiableDoc(t, sampleDoc(), tt.suite)
+			requireSignError(t, &vd, tt.signer, tt.want)
+		})
+	}
+}
+
+// RDFC suites use the same signature type as the matching JCS suite, so the
+// signer check passes. Hashing for RDFC is unsupported, and Sign fails there.
+func TestSign_UnsupportedCryptoSuite(t *testing.T) {
+	tests := []struct {
+		name   string
+		suite  CryptoSuiteType
+		signer Signer
+		want   string
+	}{
+		{
+			name:   "ecdsa-rdfc-2019",
+			suite:  CryptoSuite_ECDSA_RDFC_2019,
+			signer: mustECDSASigner(t),
+			want:   "Error hashing doc: Unsupported hashing for cryptosuite ecdsa-rdfc-2019",
+		},
+		{
+			name:   "eddsa-rdfc-2022",
+			suite:  CryptoSuite_EDDSA_RDFC_2022,
+			signer: stubSigner{kind: SigType_EDDSA},
+			want:   "Error hashing doc: Unsupported hashing for cryptosuite eddsa-rdfc-2022",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			vd := mustMakeVerifiableDoc(t, sampleDoc(), tt.suite)
+			requireSignError(t, &vd, tt.signer, tt.want)
+		})
+	}
+}
+
+// Make marshals any JSON value. Sign then needs an object so it can embed the proof.
+func TestSign_RejectsNonObjectBody(t *testing.T) {
+	var nilPtr *struct{ ID int }
+	tests := []struct {
+		name string
+		doc  any
+		want string
+	}{
+		{name: "nil", doc: nil, want: "document is null"},
+		{name: "nil pointer", doc: nilPtr, want: "document is null"},
+		{name: "nil slice", doc: []int(nil), want: "document is null"},
+		{name: "number", doc: 101, want: "json: cannot unmarshal number"},
+		{name: "string", doc: "Alice", want: "json: cannot unmarshal string"},
+		{name: "bool", doc: true, want: "json: cannot unmarshal bool"},
+		{name: "array", doc: []int{1, 2}, want: "json: cannot unmarshal array"},
+		{name: "empty array", doc: []int{}, want: "json: cannot unmarshal array"},
+		{name: "raw array", doc: json.RawMessage(`[1,2]`), want: "json: cannot unmarshal array"},
+		{name: "raw string", doc: json.RawMessage(`"Alice"`), want: "json: cannot unmarshal string"},
+		{name: "raw null", doc: json.RawMessage(`null`), want: "document is null"},
+	}
+	signer := mustECDSASigner(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			vd := mustMakeVerifiableDoc(t, tt.doc, CryptoSuite_ECDSA_JCS_2019)
+			requireSignError(t, &vd, signer, "Error parsing base doc: "+tt.want)
+		})
+	}
+}
+
+// encoding/json accepts some documents that JCS canonicalization rejects.
+// Make therefore succeeds, and Sign fails while hashing.
+func TestSign_RejectsUncanonicalizableBody(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "duplicate key", raw: `{"id":1,"id":2}`, want: "Duplicate key"},
+		{name: "number out of range", raw: `{"n":1e9999}`, want: "Number out of range"},
+		{name: "lone surrogate", raw: `{"name":"\uD800"}`, want: "Missing surrogate"},
+	}
+	signer := mustECDSASigner(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			vd := mustMakeVerifiableDoc(t, json.RawMessage(tt.raw), CryptoSuite_ECDSA_JCS_2019)
+			requireSignError(t, &vd, signer, "Error hashing doc: "+tt.want)
+		})
+	}
+}
+
+// A body that is not JSON fails in GetHash, before a signature is produced.
+func TestSign_RejectsInvalidBody(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+		want string
+	}{
+		{name: "nil", body: nil, want: "No JSON data provided"},
+		{name: "empty", body: []byte{}, want: "Unexpected EOF reached"},
+		{name: "truncated", body: []byte(`{"id":`), want: "Unexpected EOF reached"},
+		{name: "trailing junk", body: []byte(`{"id":1}x`), want: "Improperly terminated JSON object"},
+	}
+	signer := mustECDSASigner(t)
+	vm := did.MustParseDIDURL("did:web:example.com:user:101#key-1")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			vd := VerifiableDoc{
+				Body: tt.body,
+				Proof: Proof{
+					ProofType:          "DataIntegrityProof",
+					ProofPurpose:       "assertionMethod",
+					CryptoSuite:        CryptoSuite_ECDSA_JCS_2019,
+					VerificationMethod: &vm,
+					Created:            time.Date(2026, 3, 28, 15, 40, 0, 0, time.UTC),
+				},
+			}
+			requireSignError(t, &vd, signer, "Error hashing doc: "+tt.want)
+		})
+	}
+}
+
+// An ECDSA key whose scalar is zero, negative, or larger than the curve order
+// cannot sign. A signer that returns its own error is reported the same way.
+func TestSign_InvalidSigner(t *testing.T) {
+	tests := []struct {
+		name   string
+		signer func(t *testing.T) Signer
+		want   string
+	}{
+		{
+			name: "zero scalar",
+			signer: func(t *testing.T) Signer {
+				signer := mustECDSASigner(t)
+				signer.signKey.D = big.NewInt(0)
+				return signer
+			},
+			want: "Error signing doc: Error signing: ecdsa: private key scalar is zero or negative",
+		},
+		{
+			name: "negative scalar",
+			signer: func(t *testing.T) Signer {
+				signer := mustECDSASigner(t)
+				signer.signKey.D = big.NewInt(-1)
+				return signer
+			},
+			want: "Error signing doc: Error signing: ecdsa: private key scalar is zero or negative",
+		},
+		{
+			name: "scalar too large",
+			signer: func(t *testing.T) Signer {
+				signer := mustECDSASigner(t)
+				signer.signKey.D = new(big.Int).Lsh(big.NewInt(1), 256)
+				return signer
+			},
+			want: "Error signing doc: Error signing: ecdsa: private key scalar too large",
+		},
+		{
+			name: "sign error",
+			signer: func(*testing.T) Signer {
+				return stubSigner{kind: SigType_ECDSA, signErr: errors.New("key unavailable")}
+			},
+			want: "Error signing doc: key unavailable",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuite_ECDSA_JCS_2019)
+			requireSignError(t, &vd, tt.signer(t), tt.want)
+		})
+	}
+}
+
+func sampleDoc() map[string]any {
+	return map[string]any{"id": 101, "name": "Alice"}
+}
+
+func mustMakeVerifiableDoc(t *testing.T, doc any, cs CryptoSuiteType) VerifiableDoc {
+	t.Helper()
+	vm := did.MustParseDIDURL("did:web:example.com:user:101#key-1")
+	vd, err := MakeVerifiableDoc(doc, cs, &vm)
+	if err != nil {
+		t.Fatalf("Make: %v", err)
+	}
+	return vd
+}
+
+func mustECDSASigner(t *testing.T) *ECDSASigner {
+	t.Helper()
+	signer, err := GenerateECDSASigner(elliptic.P256())
+	if err != nil {
+		t.Fatalf("GenerateECDSASigner: %v", err)
+	}
+	return signer
+}
+
+func requireMakeError(t *testing.T, doc any, want string) {
+	t.Helper()
+	vm := did.MustParseDIDURL("did:web:example.com:user:101#key-1")
+	vd, err := MakeVerifiableDoc(doc, CryptoSuite_ECDSA_JCS_2019, &vm)
+	if err == nil {
+		t.Fatal("Make succeeded")
+	}
+	if vd.Body != nil || vd.Proof.ProofType != "" {
+		t.Fatalf("Make returned a partial doc on error: body %s type %q", vd.Body, vd.Proof.ProofType)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("error = %q, want substring %q", err, want)
+	}
+}
+
+func requireSignError(t *testing.T, vd *VerifiableDoc, signer Signer, want string) {
+	t.Helper()
+	signed, err := vd.Sign(signer)
+	if err == nil {
+		t.Fatalf("Sign succeeded: %s", signed)
+	}
+	if len(signed) != 0 {
+		t.Fatalf("Sign returned %q with error %v", signed, err)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("error = %q, want substring %q", err, want)
+	}
+}
+
+// refuseJSON is a document whose MarshalJSON method fails.
+type refuseJSON struct{}
+
+func (refuseJSON) MarshalJSON() ([]byte, error) {
+	return nil, errors.New("refuse to marshal")
+}
+
+// stubSigner stands in for signature types this package cannot generate,
+// and for a sign call that fails on its own.
+type stubSigner struct {
+	kind    SigType
+	signErr error
+}
+
+func (s stubSigner) sign([]byte) ([]byte, error) {
+	if s.signErr != nil {
+		return nil, s.signErr
+	}
+	return []byte{0x01}, nil
+}
+
+func (s stubSigner) sigType() SigType { return s.kind }
+
+func (s stubSigner) hash(data []byte) []byte {
+	sum := sha256.Sum256(data)
+	return sum[:]
+}
+
+func (s stubSigner) verifier() SigVerifier { return nil }
 
 func TestCryptoSuiteType_StringAndParse(t *testing.T) {
 	tests := []struct {
