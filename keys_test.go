@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/lestrrat-go/jwx/v3/jwk"
 	"github.com/multiformats/go-multibase"
 )
 
@@ -473,4 +474,115 @@ func mustDecodeHex(t *testing.T, s string) []byte {
 		t.Fatalf("decode hex: %v", err)
 	}
 	return decoded
+}
+
+// jwkVectors are fixed public JWKs with a signature over msg made by the
+// matching private key. ECDSA signatures are r || s over the curve's paired
+// hash of msg. The Ed25519 signature is PureEdDSA over msg.
+var jwkVectors = []struct {
+	name    string
+	jwk     string
+	msg     string
+	sig     string
+	sigType SigType
+}{
+	{
+		name: "P-256",
+		jwk:  `{"kty":"EC","crv":"P-256","x":"LBNH18YEH_p6qrdchyhAwcMxxILF0JleBHhAXC_q20Y","y":"aE21SsBS2M5tQJj1yDjUWocqcmwMcvBK7MvhAfTHOMk"}`,
+		msg:  "jwk test message for P-256",
+		sig: "f43dbcaee509e2095b20b25f01682d02ae0f0605dd91d42594468fc9cf34e813" +
+			"31460f5e9101bc18fdb6dd7a3394e705b793961783ee73d7889d64e0f8f351e5",
+		sigType: SigType_ECDSA,
+	},
+	{
+		name: "P-384",
+		jwk:  `{"kty":"EC","crv":"P-384","x":"grf8ZHrRDswRg9J7ZcqLmjR6DsI4FZ6NdwkUQ20wGAyhvFdlFM7VfZ_O0IaGN2uQ","y":"SPNKkIzF7QMW_4e9xRwE_Vl3FE8EhxnYJqQagdsqjBepga-HfE0WBHQ_Dl5jtTev"}`,
+		msg:  "jwk test message for P-384",
+		sig: "437920ce2bb6da476154e5f9a1b15078635406b2bcee2abf28f3255698a14164" +
+			"dea076a3b359550db039476b29afb2cf0817be0c2f9cab8089d45f47f2aecb0d" +
+			"565e064e0248f1aeca1073bbc7679c1f3ca6789069a85ba401f80ee324ad2ea7",
+		sigType: SigType_ECDSA,
+	},
+	{
+		name: "P-521",
+		jwk:  `{"kty":"EC","crv":"P-521","x":"AXV1zjdoQOKEVmjeRducHwsaFP7KwsT8cowwBjdtmo06sfM0psFcFMe7C0SF2mpguVTXYxJoymBzvlv6GnnD8hDK","y":"AD343AwrlJjZ81j4c71ra8vScMHcoq1W9_3REl0vZQmaxvRSj8c7McB-4q1ZIz3RdXJ0qY0MNmJNuK3wT51WpmDL"}`,
+		msg:  "jwk test message for P-521",
+		sig: "007e8cbfe7c108a808253763082db40625835a6c2b16c0dffdd21ee45792dbd4" +
+			"fa23cd8681eb47b41cb61f70dc0a1cd49b2cf7d357648b46e27996ffc6b9f757" +
+			"644a00b2d14c658b362d26d6cb1391e2b63c919334cc8fa0b6047602edddbb51" +
+			"c3148f269fd447abf0618b43ddcabb42fc4c7fd6e2115f6298c65263c1b542bb" +
+			"a4d9c438",
+		sigType: SigType_ECDSA,
+	},
+	{
+		name: "Ed25519",
+		jwk:  `{"kty":"OKP","crv":"Ed25519","x":"ht5vVxVpT5ZAWxOcNw_Odgrd3swyV8yeuph7Nr2d_tI"}`,
+		msg:  "jwk test message for Ed25519",
+		sig: "e55cc9083bfb10632b7d22892b9f35b64d9e7e0832f95ec0a2285976f45c705d" +
+			"be525bbc0db99cda112c298b90c6cf046fdb9955e9b9589b12317dcf698c0e0f",
+		sigType: SigType_EDDSA,
+	},
+}
+
+func TestVerifierFromJWK_VerifiesKnownSignature(t *testing.T) {
+	for _, tc := range jwkVectors {
+		t.Run(tc.name, func(t *testing.T) {
+			key, err := jwk.ParseKey([]byte(tc.jwk))
+			if err != nil {
+				t.Fatalf("ParseKey() error = %v", err)
+			}
+			verifier, err := VerifierFromJWK(key)
+			if err != nil {
+				t.Fatalf("VerifierFromJWK() error = %v", err)
+			}
+			if got := verifier.sigType(); got != tc.sigType {
+				t.Fatalf("sigType() = %v, want %v", got, tc.sigType)
+			}
+			switch tc.sigType {
+			case SigType_ECDSA:
+				v, ok := verifier.(*ECDSAVerifier)
+				if !ok {
+					t.Fatalf("verifier type = %T, want *ECDSAVerifier", verifier)
+				}
+				if got := v.pubKey.Curve.Params().Name; got != tc.name {
+					t.Fatalf("curve = %s, want %s", got, tc.name)
+				}
+			case SigType_EDDSA:
+				if _, ok := verifier.(*EDDSAVerifier); !ok {
+					t.Fatalf("verifier type = %T, want *EDDSAVerifier", verifier)
+				}
+			}
+
+			msg := []byte(tc.msg)
+			sig := mustDecodeHex(t, tc.sig)
+			ok, err := verifier.verify(msg, sig)
+			if err != nil {
+				t.Fatalf("verify() error = %v", err)
+			}
+			if !ok {
+				t.Fatal("verify() = false, want true")
+			}
+
+			tamperedMsg := append(bytes.Clone(msg), '!')
+			assertVerifyRejected(t, verifier, tamperedMsg, sig)
+			tamperedSig := bytes.Clone(sig)
+			tamperedSig[len(tamperedSig)-1] ^= 0x01
+			assertVerifyRejected(t, verifier, msg, tamperedSig)
+		})
+	}
+}
+
+func TestVerifierFromJWK_RSAUnsupported(t *testing.T) {
+	const rsaJWK = `{"kty":"RSA","n":"uteGojBE7QA0wW5aS6ALw-7q8EawPWOW-DHBVrmxaDvXuX4sLn2Gj-2ctRIV7paDnQnv4s-6aLMLiibjW8SbOg4555PCkFxvII5Vftw1EwDoliOEFX-kg0MVRlYgS1bSdPIx1-_WneiNUQC8GQf7Rqdud_e340VZU9r3Gaqt5VhQ9rlGUZQr5eOKNDCAD8PnuKQeDd7FzNaAb0_mdRqAzoK_gJfc1ntZAcxQsZ1dd0As8wrD1YdzuPnl_VEp0RcpHZErGS2_CfwAtAQjxk3ZPHzaWVXv8vFAdHKhV4kOEviRWCk2lucebr4I47RPQXmlJJzME7FhY1qPWO3gEyoosQ","e":"AQAB"}`
+	key, err := jwk.ParseKey([]byte(rsaJWK))
+	if err != nil {
+		t.Fatalf("ParseKey() error = %v", err)
+	}
+	verifier, err := VerifierFromJWK(key)
+	if err == nil {
+		t.Fatalf("VerifierFromJWK() = %T, want error", verifier)
+	}
+	if !strings.Contains(err.Error(), "Unsupported key type") {
+		t.Fatalf("VerifierFromJWK() error = %q, want unsupported key type", err)
+	}
 }

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/lestrrat-go/jwx/v3/jwk"
 	"github.com/multiformats/go-multibase"
 )
 
@@ -194,4 +195,20 @@ func EDDSAVerifierFromBytes(keyBytes []byte) (*EDDSAVerifier, error) {
 		return nil, fmt.Errorf("Invalid EdDSA public key length, got %d expected %d", len(keyBytes), ed25519.PublicKeySize)
 	}
 	return &EDDSAVerifier{pubKey: bytes.Clone(keyBytes)}, nil
+}
+
+func VerifierFromJWK(key jwk.Key) (SigVerifier, error) {
+	var rawKey interface{}
+	if err := jwk.Export(key, &rawKey); err != nil {
+		return nil, err
+	}
+
+	switch pub := rawKey.(type) {
+	case *ecdsa.PublicKey:
+		return &ECDSAVerifier{pubKey: pub}, nil
+	case ed25519.PublicKey:
+		return &EDDSAVerifier{pubKey: pub}, nil
+	default:
+		return nil, fmt.Errorf("Unsupported key type: %s", key.KeyType().String())
+	}
 }
