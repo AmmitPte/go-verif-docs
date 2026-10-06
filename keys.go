@@ -14,6 +14,7 @@ import (
 
 	"github.com/lestrrat-go/jwx/v3/jwk"
 	"github.com/multiformats/go-multibase"
+	"github.com/nuts-foundation/go-did/did"
 )
 
 type SigType int
@@ -211,4 +212,16 @@ func VerifierFromJWK(key jwk.Key) (SigVerifier, error) {
 	default:
 		return nil, fmt.Errorf("Unsupported key type: %s", key.KeyType().String())
 	}
+}
+
+func ExtractKey(doc *did.Document, keyURL *did.DIDURL) (jwk.Key, error) {
+	for _, vm := range doc.VerificationMethod {
+		if vm.ID.Equals(*keyURL) {
+			key, err := vm.JWK()
+			if err == nil && key != nil {
+				return key, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("Could not find key for URL %s", keyURL.String())
 }

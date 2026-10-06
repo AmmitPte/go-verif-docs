@@ -2,12 +2,15 @@ package verifdocs
 
 import (
 	"bytes"
+	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"math/big"
 	"strings"
@@ -15,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gowebpki/jcs"
+	ssi "github.com/nuts-foundation/go-did"
 	"github.com/nuts-foundation/go-did/did"
 )
 
@@ -743,6 +747,112 @@ func TestVerifDocVerify(t *testing.T) {
 	}
 }
 
+// Helper to print out a sample doc and matching DID.
+func MakeDocWithDID(t *testing.T) {
+	// First make a DID and DID doc
+	const didIDString = "did:web:example.com:user:101"
+	didID, err := did.ParseDID(didIDString)
+	if err != nil {
+		t.Fatalf("Could not parse DID path: %s", err)
+	}
+
+	didDoc := &did.Document{
+		Context: []interface{}{did.DIDContextV1URI()},
+		ID:      *didID,
+	}
+	didKeyPath := didIDString + "#key-1"
+	didKeyURL, _ := did.ParseDIDURL(didKeyPath)
+	signKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	verificationMethod, err := did.NewVerificationMethod(*didKeyURL, ssi.JsonWebKey2020, did.DID{}, signKey.Public())
+	didDoc.AddAssertionMethod(verificationMethod)
+	didJson, _ := json.MarshalIndent(didDoc, "", "  ")
+	fmt.Printf("Sample DID: %s\n", didID.String())
+	keyBytes, _ := signKey.Bytes()
+	fmt.Printf("Signing key: %s\n", hex.EncodeToString(keyBytes))
+	fmt.Println("Sample DID Doc:")
+	fmt.Println(string(didJson))
+
+	baseDoc := struct {
+		ID   int    `json:"id"`
+		Name string `json:"name"`
+	}{
+		ID:   101,
+		Name: "Alice",
+	}
+	vd, err := MakeVerifiableDoc(baseDoc, CryptoSuite_ECDSA_JCS_2019, didKeyURL)
+	if err != nil {
+		t.Fatalf("Error making verifiable doc: %s", err)
+	}
+	signer := ECDSASigner{
+		signKey: *signKey,
+	}
+	signedDoc, err := vd.Sign(signer)
+	if err != nil {
+		t.Fatalf("Error signing verifiable doc: %s", err)
+	}
+	fmt.Println("Signed doc:")
+	fmt.Println(string(signedDoc))
+	// t.Error("blah")
+}
+
+func TestVerifyDocFromDID(t *testing.T) {
+	const sampleDocStr = `{"id":101,"name":"Alice","proof":{"type":"DataIntegrityProof","proofPurpose":"assertionMethod","cryptosuite":"ecdsa-jcs-2019","verificationMethod":"did:web:example.com:user:101#key-1","proofValue":"z41BkGy5VEDeqrKqFwea5br1gmaZKT9YESoCVz2ESsvoFScazx6Le8VytRisoKjkzD63aF8DH38U74sjaBLu7CMzF","created":"2026-10-06T15:06:41.070247+08:00","expiry":"0001-01-01T00:00:00Z"}}`
+	const didDocStr = `{
+  "@context": "https://www.w3.org/ns/did/v1",
+  "assertionMethod": [
+    "did:web:example.com:user:101#key-1"
+  ],
+  "id": "did:web:example.com:user:101",
+  "verificationMethod": [
+    {
+      "controller": "did:web:example.com:user:101",
+      "id": "did:web:example.com:user:101#key-1",
+      "publicKeyJwk": {
+        "crv": "P-256",
+        "kty": "EC",
+        "x": "og9qNE10V4aSHCTMJFCAcciUfbUqk_pe4MXlqVqEEow",
+        "y": "NirPmr7CcLI6GVlNNCvOrA7YKfnj40VT8bEKMZ591QU"
+      },
+      "type": "JsonWebKey2020"
+    }
+  ]
+}`
+
+	vd, err := ParseDoc([]byte(sampleDocStr))
+	if err != nil {
+		t.Fatalf("Error parsing doc: %s", err)
+	}
+
+	// At this point we'd go and fetch the DID
+	didDoc, err := did.ParseDocument(didDocStr)
+	if err != nil {
+		t.Fatalf("Error parsing did doc: %s", err)
+	}
+	if vd.Proof.VerificationMethod.DID != didDoc.ID {
+		t.Errorf("Proof DID does not match DID Doc, proof DID = %s, doc DID = %s", vd.Proof.VerificationMethod.DID.String(), didDoc.ID.String())
+	}
+
+	// Extract the key for the DID Doc and make a verifier.
+	keyURL := vd.Proof.VerificationMethod
+	key, err := ExtractKey(didDoc, keyURL)
+	if err != nil {
+		t.Fatalf("Error extracting key: %s\nKey URL: %s", err, keyURL.String())
+	}
+	verifier, err := VerifierFromJWK(key)
+	if err != nil {
+		t.Fatalf("Error getting verifier for key: %s", err)
+	}
+
+	// Now verify the doc.
+	b, err := vd.Verify(verifier)
+	if err != nil {
+		t.Fatalf("Error verifying doc: %s", err)
+	}
+	if !b {
+		t.Error("Doc failed to verify.")
+	}
+}
+
 func TestMakeVerifDoc(t *testing.T) {
 	baseDoc := struct {
 		ID   int    `json:"id"`
@@ -1151,6 +1261,10 @@ func (s stubSigner) hash(data []byte) []byte {
 }
 
 func (s stubSigner) verifier() SigVerifier { return nil }
+
+func TestVerifyAgainstDID(t *testing.T) {
+
+}
 
 func TestCryptoSuiteType_StringAndParse(t *testing.T) {
 	tests := []struct {
