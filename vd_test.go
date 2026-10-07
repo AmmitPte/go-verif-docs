@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -796,6 +797,9 @@ func MakeDocWithDID(t *testing.T) {
 }
 
 func TestVerifyDocFromDID(t *testing.T) {
+	// This doc was signed by an earlier version that wrote a local-time created
+	// and a zero "expiry" field. Neither is standard, but both are covered by the
+	// signature, so it must still verify.
 	const sampleDocStr = `{"id":101,"name":"Alice","proof":{"type":"DataIntegrityProof","proofPurpose":"assertionMethod","cryptosuite":"ecdsa-jcs-2019","verificationMethod":"did:web:example.com:user:101#key-1","proofValue":"z41BkGy5VEDeqrKqFwea5br1gmaZKT9YESoCVz2ESsvoFScazx6Le8VytRisoKjkzD63aF8DH38U74sjaBLu7CMzF","created":"2026-10-06T15:06:41.070247+08:00","expiry":"0001-01-01T00:00:00Z"}}`
 	const didDocStr = `{
   "@context": "https://www.w3.org/ns/did/v1",
@@ -919,6 +923,180 @@ func TestSignVerifDoc(t *testing.T) {
 	}
 	if !b {
 		t.Error("Signed doc failed to verify.")
+	}
+}
+
+// Data Integrity timestamps are XML Schema dateTimeStamp values. Make writes
+// them in UTC with whole seconds so every implementation reads them the same.
+var wholeSecondUTC = regexp.MustCompile(`^"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"$`)
+
+func TestMakeVerifiableDoc_CreatedIsUTCWholeSeconds(t *testing.T) {
+	before := time.Now().Truncate(time.Second)
+	vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuite_ECDSA_JCS_2019)
+	after := time.Now()
+
+	created := vd.Proof.Created
+	if created.Location() != time.UTC {
+		t.Errorf("created location = %s, want UTC", created.Location())
+	}
+	if created.Nanosecond() != 0 {
+		t.Errorf("created = %s, want whole seconds", created.Format(time.RFC3339Nano))
+	}
+	if created.Before(before) || created.After(after) {
+		t.Errorf("created = %s, want between %s and %s", created, before, after)
+	}
+	if !vd.Proof.Expires.IsZero() {
+		t.Errorf("expires = %s, want unset", vd.Proof.Expires)
+	}
+}
+
+func TestSign_ProofTimestamps(t *testing.T) {
+	created := time.Date(2026, 3, 28, 15, 40, 0, 0, time.UTC)
+	expires := created.Add(24 * time.Hour)
+	tests := []struct {
+		name        string
+		created     time.Time
+		expires     time.Time
+		wantCreated string // empty means the field must be absent
+		wantExpires string // empty means the field must be absent
+	}{
+		{
+			name:        "created only",
+			created:     created,
+			wantCreated: `"2026-03-28T15:40:00Z"`,
+		},
+		{
+			name:        "created and expires",
+			created:     created,
+			expires:     expires,
+			wantCreated: `"2026-03-28T15:40:00Z"`,
+			wantExpires: `"2026-03-29T15:40:00Z"`,
+		},
+		{
+			name: "neither",
+		},
+	}
+	signer := mustECDSASigner(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuite_ECDSA_JCS_2019)
+			vd.Proof.Created = tt.created
+			vd.Proof.Expires = tt.expires
+			signed, err := vd.Sign(signer)
+			if err != nil {
+				t.Fatalf("Sign: %v", err)
+			}
+
+			proof := signedProofFields(t, signed)
+			if _, ok := proof["expiry"]; ok {
+				t.Errorf("proof has non-standard expiry field: %s", proof["expiry"])
+			}
+			requireRawField(t, proof, "created", tt.wantCreated)
+			requireRawField(t, proof, "expires", tt.wantExpires)
+
+			parsed, err := ParseDoc(signed)
+			if err != nil {
+				t.Fatalf("ParseDoc: %v", err)
+			}
+			if !parsed.Proof.Created.Equal(tt.created) {
+				t.Errorf("parsed created = %s, want %s", parsed.Proof.Created, tt.created)
+			}
+			if !parsed.Proof.Expires.Equal(tt.expires) {
+				t.Errorf("parsed expires = %s, want %s", parsed.Proof.Expires, tt.expires)
+			}
+			ok, err := parsed.Verify(signer.verifier())
+			if err != nil {
+				t.Fatalf("Verify: %v", err)
+			}
+			if !ok {
+				t.Fatal("Verify returned false")
+			}
+		})
+	}
+}
+
+// A freshly made and signed doc writes created as whole-second UTC and leaves
+// expires out.
+func TestSign_DefaultTimestampFormat(t *testing.T) {
+	vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuite_ECDSA_JCS_2019)
+	signed, err := vd.Sign(mustECDSASigner(t))
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	proof := signedProofFields(t, signed)
+	if got := string(proof["created"]); !wholeSecondUTC.MatchString(got) {
+		t.Errorf("created = %s, want whole-second UTC like \"2026-03-28T15:40:00Z\"", got)
+	}
+	for _, field := range []string{"expires", "expiry"} {
+		if got, ok := proof[field]; ok {
+			t.Errorf("proof has %s = %s, want it absent", field, got)
+		}
+	}
+}
+
+func TestParseDoc_ProofTimestamps(t *testing.T) {
+	tests := []struct {
+		name        string
+		proof       string
+		wantCreated time.Time
+		wantExpires time.Time
+	}{
+		{
+			name:        "created and expires",
+			proof:       `{"type":"DataIntegrityProof","proofPurpose":"assertionMethod","created":"2026-03-28T15:40:00Z","expires":"2027-03-28T15:40:00Z"}`,
+			wantCreated: time.Date(2026, 3, 28, 15, 40, 0, 0, time.UTC),
+			wantExpires: time.Date(2027, 3, 28, 15, 40, 0, 0, time.UTC),
+		},
+		{
+			name:        "offset and fractional seconds",
+			proof:       `{"type":"DataIntegrityProof","proofPurpose":"assertionMethod","created":"2026-10-06T15:06:41.070247+08:00"}`,
+			wantCreated: time.Date(2026, 10, 6, 7, 6, 41, 70247000, time.UTC),
+		},
+		{
+			name:  "absent",
+			proof: `{"type":"DataIntegrityProof","proofPurpose":"assertionMethod"}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			doc := mustParseCredential(t, docWithProof(tt.proof))
+			if !doc.Proof.Created.Equal(tt.wantCreated) {
+				t.Errorf("created = %s, want %s", doc.Proof.Created, tt.wantCreated)
+			}
+			if !doc.Proof.Expires.Equal(tt.wantExpires) {
+				t.Errorf("expires = %s, want %s", doc.Proof.Expires, tt.wantExpires)
+			}
+		})
+	}
+}
+
+func signedProofFields(t *testing.T, signed []byte) map[string]json.RawMessage {
+	t.Helper()
+	var doc struct {
+		Proof map[string]json.RawMessage `json:"proof"`
+	}
+	if err := json.Unmarshal(signed, &doc); err != nil {
+		t.Fatalf("unmarshal signed doc: %v", err)
+	}
+	if doc.Proof == nil {
+		t.Fatalf("signed doc has no proof: %s", signed)
+	}
+	return doc.Proof
+}
+
+// requireRawField checks a raw JSON field. An empty want means the field must be absent.
+func requireRawField(t *testing.T, fields map[string]json.RawMessage, name, want string) {
+	t.Helper()
+	got, ok := fields[name]
+	switch {
+	case want == "" && ok:
+		t.Errorf("%s = %s, want it absent", name, got)
+	case want != "" && !ok:
+		t.Errorf("%s is absent, want %s", name, want)
+	case want != "" && string(got) != want:
+		t.Errorf("%s = %s, want %s", name, got, want)
 	}
 }
 

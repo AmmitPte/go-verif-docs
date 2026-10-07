@@ -86,8 +86,8 @@ type Proof struct {
 	CryptoSuite        CryptoSuiteType `json:"cryptosuite"`
 	VerificationMethod *did.DIDURL     `json:"verificationMethod"`
 	ProofValue         MultibaseBytes  `json:"proofValue,omitempty"`
-	Created            time.Time       `json:"created,omitempty"`
-	Expiry             time.Time       `json:"expiry,omitempty"`
+	Created            time.Time       `json:"created,omitzero"`
+	Expires            time.Time       `json:"expires,omitzero"`
 }
 
 // A Verifiable Doc is just a body (without the proof), and a proof.
@@ -226,7 +226,8 @@ func MakeVerifiableDoc(doc any, cs CryptoSuiteType, vm *did.DIDURL) (VerifiableD
 		ProofPurpose:       "assertionMethod",
 		CryptoSuite:        cs,
 		VerificationMethod: vm,
-		Created:            time.Now(),
+		// UTC with whole seconds, the plainest form of an XML Schema dateTimeStamp.
+		Created: time.Now().UTC().Truncate(time.Second),
 	}
 
 	vd := VerifiableDoc{
