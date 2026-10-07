@@ -214,14 +214,32 @@ func VerifierFromJWK(key jwk.Key) (SigVerifier, error) {
 	}
 }
 
+// ExtractKey returns the public key that keyURL names in a DID document.
+// The key must be listed under assertionMethod, because that is the
+// relationship a DID controller uses to authorise keys for signing documents.
+// It can be a reference to a verification method or embedded directly.
+// Only keys given as publicKeyJwk are supported.
 func ExtractKey(doc *did.Document, keyURL *did.DIDURL) (jwk.Key, error) {
-	for _, vm := range doc.VerificationMethod {
-		if vm.ID.Equals(*keyURL) {
-			key, err := vm.JWK()
-			if err == nil && key != nil {
-				return key, nil
-			}
-		}
+	if doc == nil {
+		return nil, fmt.Errorf("No DID document given")
 	}
-	return nil, fmt.Errorf("Could not find key for URL %s", keyURL.String())
+	if keyURL == nil {
+		return nil, fmt.Errorf("No key URL given")
+	}
+
+	// go-did resolves references, including relative ones, when it parses the
+	// document, so this finds both referenced and embedded assertion methods.
+	vm := doc.AssertionMethod.FindByID(*keyURL)
+	if vm == nil {
+		return nil, fmt.Errorf("Key %s not found or not an assertion method", keyURL)
+	}
+
+	key, err := vm.JWK()
+	if err != nil {
+		return nil, fmt.Errorf("Could not get JWK for key %s: %w", keyURL, err)
+	}
+	if key == nil {
+		return nil, fmt.Errorf("Key %s has no publicKeyJwk", keyURL)
+	}
+	return key, nil
 }

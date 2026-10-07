@@ -2,6 +2,7 @@ package verifdocs
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/lestrrat-go/jwx/v3/jwk"
 	"github.com/multiformats/go-multibase"
+	"github.com/nuts-foundation/go-did/did"
 )
 
 // ecdsaJCSVectors are known-answer tests for multikey verification.
@@ -584,5 +586,197 @@ func TestVerifierFromJWK_RSAUnsupported(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Unsupported key type") {
 		t.Fatalf("VerifierFromJWK() error = %q, want unsupported key type", err)
+	}
+}
+
+// extractKeyDIDDoc has one verification method for each case ExtractKey must handle.
+//   - key-1: JWK, referenced from assertionMethod by its absolute URL.
+//   - key-2: JWK, listed only under authentication.
+//   - key-3: no JWK, only publicKeyMultibase, referenced from assertionMethod.
+//   - key-4: malformed JWK, referenced from assertionMethod.
+//   - key-5: JWK embedded directly in assertionMethod.
+//   - key-6: JWK, referenced from assertionMethod by the relative URL "#key-6".
+const extractKeyDIDDoc = `{
+  "@context": "https://www.w3.org/ns/did/v1",
+  "id": "did:web:example.com:user:101",
+  "verificationMethod": [
+    {
+      "id": "did:web:example.com:user:101#key-1",
+      "type": "JsonWebKey2020",
+      "controller": "did:web:example.com:user:101",
+      "publicKeyJwk": ` + extractKeyP256JWK + `
+    },
+    {
+      "id": "did:web:example.com:user:101#key-2",
+      "type": "JsonWebKey2020",
+      "controller": "did:web:example.com:user:101",
+      "publicKeyJwk": ` + extractKeyEd25519JWK + `
+    },
+    {
+      "id": "did:web:example.com:user:101#key-3",
+      "type": "Multikey",
+      "controller": "did:web:example.com:user:101",
+      "publicKeyMultibase": "z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2"
+    },
+    {
+      "id": "did:web:example.com:user:101#key-4",
+      "type": "JsonWebKey2020",
+      "controller": "did:web:example.com:user:101",
+      "publicKeyJwk": {"kty": "EC", "crv": "P-256", "x": "not base64!"}
+    },
+    {
+      "id": "did:web:example.com:user:101#key-6",
+      "type": "JsonWebKey2020",
+      "controller": "did:web:example.com:user:101",
+      "publicKeyJwk": ` + extractKeyEd25519JWK + `
+    }
+  ],
+  "authentication": ["did:web:example.com:user:101#key-2"],
+  "assertionMethod": [
+    "did:web:example.com:user:101#key-1",
+    "did:web:example.com:user:101#key-3",
+    "did:web:example.com:user:101#key-4",
+    {
+      "id": "did:web:example.com:user:101#key-5",
+      "type": "JsonWebKey2020",
+      "controller": "did:web:example.com:user:101",
+      "publicKeyJwk": ` + extractKeyP256JWK + `
+    },
+    "#key-6"
+  ]
+}`
+
+const (
+	extractKeyP256JWK    = `{"kty":"EC","crv":"P-256","x":"og9qNE10V4aSHCTMJFCAcciUfbUqk_pe4MXlqVqEEow","y":"NirPmr7CcLI6GVlNNCvOrA7YKfnj40VT8bEKMZ591QU"}`
+	extractKeyEd25519JWK = `{"kty":"OKP","crv":"Ed25519","x":"ht5vVxVpT5ZAWxOcNw_Odgrd3swyV8yeuph7Nr2d_tI"}`
+)
+
+func TestExtractKey(t *testing.T) {
+	doc, err := did.ParseDocument(extractKeyDIDDoc)
+	if err != nil {
+		t.Fatalf("ParseDocument: %v", err)
+	}
+	tests := []struct {
+		name    string
+		url     string
+		wantJWK string // set when ExtractKey must succeed
+		wantErr string // set when ExtractKey must fail
+	}{
+		{name: "assertion method reference", url: "did:web:example.com:user:101#key-1", wantJWK: extractKeyP256JWK},
+		{name: "embedded assertion method", url: "did:web:example.com:user:101#key-5", wantJWK: extractKeyP256JWK},
+		{name: "relative assertion method reference", url: "did:web:example.com:user:101#key-6", wantJWK: extractKeyEd25519JWK},
+		{name: "authentication only", url: "did:web:example.com:user:101#key-2", wantErr: "not found or not an assertion method"},
+		{name: "no JWK", url: "did:web:example.com:user:101#key-3", wantErr: "has no publicKeyJwk"},
+		{name: "malformed JWK", url: "did:web:example.com:user:101#key-4", wantErr: "could not parse public key"},
+		{name: "unknown fragment", url: "did:web:example.com:user:101#key-9", wantErr: "not found or not an assertion method"},
+		{name: "other DID", url: "did:web:other.example:user:101#key-1", wantErr: "not found or not an assertion method"},
+		{name: "no fragment", url: "did:web:example.com:user:101", wantErr: "not found or not an assertion method"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			keyURL := did.MustParseDIDURL(tt.url)
+			key, err := ExtractKey(doc, &keyURL)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("ExtractKey succeeded with key %v", key)
+				}
+				if key != nil {
+					t.Errorf("ExtractKey returned key %v with error", key)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error = %q, want substring %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ExtractKey: %v", err)
+			}
+			requireSameJWK(t, key, tt.wantJWK)
+		})
+	}
+}
+
+// A JWK error from go-did must be returned wrapped, not replaced.
+func TestExtractKey_WrapsJWKError(t *testing.T) {
+	doc, err := did.ParseDocument(extractKeyDIDDoc)
+	if err != nil {
+		t.Fatalf("ParseDocument: %v", err)
+	}
+	keyURL := did.MustParseDIDURL("did:web:example.com:user:101#key-4")
+	_, wantErr := doc.AssertionMethod.FindByID(keyURL).JWK()
+	if wantErr == nil {
+		t.Fatal("test setup: key-4 JWK parsed without error")
+	}
+
+	_, err = ExtractKey(doc, &keyURL)
+	if err == nil {
+		t.Fatal("ExtractKey succeeded")
+	}
+	if !strings.Contains(err.Error(), wantErr.Error()) {
+		t.Fatalf("error = %q, want it to contain the JWK error %q", err, wantErr)
+	}
+}
+
+func TestExtractKey_NilInputs(t *testing.T) {
+	doc, err := did.ParseDocument(extractKeyDIDDoc)
+	if err != nil {
+		t.Fatalf("ParseDocument: %v", err)
+	}
+	keyURL := did.MustParseDIDURL("did:web:example.com:user:101#key-1")
+	missingURL := did.MustParseDIDURL("did:web:example.com:user:101#key-9")
+
+	// A document built in code, rather than parsed, can hold nil entries.
+	withNils := &did.Document{
+		ID:                 doc.ID,
+		VerificationMethod: did.VerificationMethods{nil},
+		AssertionMethod:    did.VerificationRelationships{{}},
+	}
+
+	tests := []struct {
+		name string
+		doc  *did.Document
+		url  *did.DIDURL
+		want string
+	}{
+		{name: "nil document", doc: nil, url: &keyURL, want: "No DID document"},
+		{name: "nil key URL", doc: doc, url: nil, want: "No key URL"},
+		{name: "both nil", doc: nil, url: nil, want: "No DID document"},
+		{name: "empty document", doc: &did.Document{}, url: &keyURL, want: "not found or not an assertion method"},
+		{name: "nil entries", doc: withNils, url: &missingURL, want: "not found or not an assertion method"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			key, err := ExtractKey(tt.doc, tt.url)
+			if err == nil {
+				t.Fatalf("ExtractKey succeeded with key %v", key)
+			}
+			if key != nil {
+				t.Errorf("ExtractKey returned key %v with error", key)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %q, want substring %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func requireSameJWK(t *testing.T, got jwk.Key, wantJSON string) {
+	t.Helper()
+	want, err := jwk.ParseKey([]byte(wantJSON))
+	if err != nil {
+		t.Fatalf("parse expected JWK: %v", err)
+	}
+	gotPrint, err := got.Thumbprint(crypto.SHA256)
+	if err != nil {
+		t.Fatalf("thumbprint of returned key: %v", err)
+	}
+	wantPrint, err := want.Thumbprint(crypto.SHA256)
+	if err != nil {
+		t.Fatalf("thumbprint of expected key: %v", err)
+	}
+	if !bytes.Equal(gotPrint, wantPrint) {
+		t.Fatalf("returned key %x, want %x", gotPrint, wantPrint)
 	}
 }
