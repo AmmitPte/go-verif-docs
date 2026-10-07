@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/big"
 
@@ -152,23 +153,51 @@ func (v EDDSAVerifier) sigType() SigType {
 	return SigType_EDDSA
 }
 
+// Public key multicodecs from the multiformats table. A Multikey is one of
+// these codecs as an unsigned varint, followed by the key bytes.
+const (
+	codecP256    = 0x1200 // p256-pub, compressed point
+	codecP384    = 0x1201 // p384-pub, compressed point
+	codecP521    = 0x1202 // p521-pub, compressed point
+	codecEd25519 = 0xed   // ed25519-pub; encoded as the varint bytes 0xed 0x01
+)
+
+// multikeyCurves maps each supported ECDSA multicodec to its curve.
+var multikeyCurves = map[uint64]elliptic.Curve{
+	codecP256: elliptic.P256(),
+	codecP384: elliptic.P384(),
+	codecP521: elliptic.P521(),
+}
+
+// VerifierFromMultikey returns a verifier for a Multikey-encoded public key,
+// as found in a verification method's publicKeyMultibase.
 func VerifierFromMultikey(data string) (SigVerifier, error) {
-	_, decodedBytes, err := multibase.Decode(data)
+	_, decoded, err := multibase.Decode(data)
 	if err != nil {
 		return nil, err
 	}
-	codec, bytesRead := binary.Uvarint(decodedBytes)
-	switch codec {
-	case 0x1200:
-		return ECDSAVerifierFromBytes(elliptic.P256(), decodedBytes[bytesRead:])
-	case 0x1201:
-		return ECDSAVerifierFromBytes(elliptic.P384(), decodedBytes[bytesRead:])
-	case 0x1202:
-		return ECDSAVerifierFromBytes(elliptic.P521(), decodedBytes[bytesRead:])
-	case 0xed: // ed25519-pub; the multikey prefix is the varint 0xed01
-		return EDDSAVerifierFromBytes(decodedBytes[bytesRead:])
+	codec, n := binary.Uvarint(decoded)
+	if n <= 0 {
+		return nil, errors.New("invalid multicodec prefix")
 	}
-	return nil, fmt.Errorf("unsupported multicodec: %d", codec)
+	keyBytes := decoded[n:]
+
+	if codec == codecEd25519 {
+		v, err := EDDSAVerifierFromBytes(keyBytes)
+		if err != nil {
+			return nil, err
+		}
+		return v, nil
+	}
+	curve, ok := multikeyCurves[codec]
+	if !ok {
+		return nil, fmt.Errorf("unsupported multicodec: 0x%x", codec)
+	}
+	v, err := ECDSAVerifierFromBytes(curve, keyBytes)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
 func ECDSAVerifierFromBytes(curve elliptic.Curve, keyBytes []byte) (*ECDSAVerifier, error) {
@@ -214,12 +243,14 @@ func VerifierFromJWK(key jwk.Key) (SigVerifier, error) {
 	}
 }
 
-// ExtractKey returns the public key that keyURL names in a DID document.
-// The key must be listed under assertionMethod, because that is the
-// relationship a DID controller uses to authorise keys for signing documents.
-// It can be a reference to a verification method or embedded directly.
-// Only keys given as publicKeyJwk are supported.
-func ExtractKey(doc *did.Document, keyURL *did.DIDURL) (jwk.Key, error) {
+// GetAssertionVerifier returns a verifier for the key that keyURL names in a
+// DID document. The key must be listed under assertionMethod, because that is
+// the relationship a DID controller uses to authorise keys for signing
+// documents. It can be a reference to a verification method or embedded directly.
+//
+// The key can be given as publicKeyJwk or as a Multikey in publicKeyMultibase.
+// Other formats, such as publicKeyBase58, are not supported.
+func GetAssertionVerifier(doc *did.Document, keyURL *did.DIDURL) (SigVerifier, error) {
 	if doc == nil {
 		return nil, fmt.Errorf("No DID document given")
 	}
@@ -233,13 +264,41 @@ func ExtractKey(doc *did.Document, keyURL *did.DIDURL) (jwk.Key, error) {
 	if vm == nil {
 		return nil, fmt.Errorf("Key %s not found or not an assertion method", keyURL)
 	}
+	return verifierFromMethod(vm)
+}
 
-	key, err := vm.JWK()
-	if err != nil {
-		return nil, fmt.Errorf("Could not get JWK for key %s: %w", keyURL, err)
+// verifierFromMethod makes a verifier from the key material in a verification
+// method. A method must not carry the same key in more than one format, so
+// one with both publicKeyJwk and publicKeyMultibase is rejected.
+func verifierFromMethod(vm *did.VerificationMethod) (SigVerifier, error) {
+	hasJWK := vm.PublicKeyJwk != nil
+	hasMultibase := vm.PublicKeyMultibase != ""
+
+	switch {
+	case hasJWK && hasMultibase:
+		return nil, fmt.Errorf("Key %s has both publicKeyJwk and publicKeyMultibase", vm.ID)
+	case hasJWK:
+		key, err := vm.JWK()
+		if err != nil {
+			return nil, fmt.Errorf("Could not get JWK for key %s: %w", vm.ID, err)
+		}
+		// go-did returns a nil key only when there is no publicKeyJwk, which
+		// was checked above. Guard anyway rather than pass a nil key on.
+		if key == nil {
+			return nil, fmt.Errorf("Key %s has no publicKeyJwk", vm.ID)
+		}
+		verifier, err := VerifierFromJWK(key)
+		if err != nil {
+			return nil, fmt.Errorf("Could not make verifier for key %s: %w", vm.ID, err)
+		}
+		return verifier, nil
+	case hasMultibase:
+		verifier, err := VerifierFromMultikey(vm.PublicKeyMultibase)
+		if err != nil {
+			return nil, fmt.Errorf("Could not make verifier for key %s: %w", vm.ID, err)
+		}
+		return verifier, nil
+	default:
+		return nil, fmt.Errorf("Key %s has no publicKeyJwk or publicKeyMultibase", vm.ID)
 	}
-	if key == nil {
-		return nil, fmt.Errorf("Key %s has no publicKeyJwk", keyURL)
-	}
-	return key, nil
 }

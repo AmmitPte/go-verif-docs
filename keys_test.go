@@ -2,7 +2,6 @@ package verifdocs
 
 import (
 	"bytes"
-	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -11,6 +10,7 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"math/big"
 	"strings"
 	"testing"
@@ -29,12 +29,14 @@ import (
 //
 // That specification does not publish a P-521 vector. The P-521 entry is a
 // fixed signature over SHA-512 of the digest.
-var ecdsaJCSVectors = []struct {
+type multikeyVector struct {
 	name   string
 	key    string
 	digest string
 	sig    string
-}{
+}
+
+var ecdsaJCSVectors = []multikeyVector{
 	{
 		name: "P-256",
 		key:  "zDnaepBuvsQ8cpsWrVKw8fbpGpvPeNSjVPTWoq6cRqaYzBKVP",
@@ -66,14 +68,9 @@ var ecdsaJCSVectors = []struct {
 	},
 }
 
-// Multicodecs from the multiformats table.
-const (
-	codecP256    = 0x1200
-	codecP384    = 0x1201
-	codecP521    = 0x1202
-	codecEd25519 = 0xed
-	codecX25519  = 0xec
-)
+// codecX25519 is the x25519-pub multicodec, a key-agreement key this package
+// does not support. The supported codecs are defined in keys.go.
+const codecX25519 = 0xec
 
 // eddsa-jcs-2022 vector from Appendix B.3 of
 // https://w3c.github.io/vc-di-eddsa/#representation-eddsa-jcs-2022
@@ -254,9 +251,13 @@ func TestVerifierFromMultikey_WrongKeyLength(t *testing.T) {
 				t.Run(name, func(t *testing.T) {
 					keyBytes := bytes.Repeat([]byte{0x02}, curve.keySize+delta)
 					key := encodeMultikey(t, curve.codec, keyBytes)
-					_, err := VerifierFromMultikey(key)
+					verifier, err := VerifierFromMultikey(key)
 					if err == nil {
 						t.Fatal("expected an error for the wrong key length")
+					}
+					// A nil pointer inside a non-nil interface would pass a nil check by the caller.
+					if verifier != nil {
+						t.Errorf("verifier = %#v, want nil interface with error", verifier)
 					}
 					if !strings.Contains(err.Error(), "public key length") {
 						t.Fatalf("error = %q, want a public key length error", err)
@@ -286,12 +287,46 @@ func TestVerifierFromMultikey_InvalidCurvePoint(t *testing.T) {
 			point[len(point)-1] = 0x07
 
 			key := encodeMultikey(t, curve.codec, point)
-			_, err := VerifierFromMultikey(key)
+			verifier, err := VerifierFromMultikey(key)
 			if err == nil {
 				t.Fatal("expected an error for an invalid curve point")
 			}
+			// A nil pointer inside a non-nil interface would pass a nil check by the caller.
+			if verifier != nil {
+				t.Errorf("verifier = %#v, want nil interface with error", verifier)
+			}
 			if !strings.Contains(err.Error(), "curve point") {
 				t.Fatalf("error = %q, want a curve point error", err)
+			}
+		})
+	}
+}
+
+// A multicodec prefix that is not a complete, valid varint must fail cleanly.
+func TestVerifierFromMultikey_InvalidPrefix(t *testing.T) {
+	tests := []struct {
+		name    string
+		decoded []byte
+	}{
+		{name: "truncated varint", decoded: []byte{0x80}},
+		{name: "varint overflows 64 bits", decoded: bytes.Repeat([]byte{0xff}, binary.MaxVarintLen64+1)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			key, err := multibase.Encode(multibase.Base58BTC, tt.decoded)
+			if err != nil {
+				t.Fatalf("multibase encode: %v", err)
+			}
+			verifier, err := VerifierFromMultikey(key)
+			if err == nil {
+				t.Fatalf("VerifierFromMultikey succeeded with %T", verifier)
+			}
+			if verifier != nil {
+				t.Errorf("verifier = %#v, want nil interface with error", verifier)
+			}
+			if !strings.Contains(err.Error(), "invalid multicodec prefix") {
+				t.Fatalf("error = %q, want an invalid multicodec prefix error", err)
 			}
 		})
 	}
@@ -481,13 +516,15 @@ func mustDecodeHex(t *testing.T, s string) []byte {
 // jwkVectors are fixed public JWKs with a signature over msg made by the
 // matching private key. ECDSA signatures are r || s over the curve's paired
 // hash of msg. The Ed25519 signature is PureEdDSA over msg.
-var jwkVectors = []struct {
+type jwkVector struct {
 	name    string
 	jwk     string
 	msg     string
 	sig     string
 	sigType SigType
-}{
+}
+
+var jwkVectors = []jwkVector{
 	{
 		name: "P-256",
 		jwk:  `{"kty":"EC","crv":"P-256","x":"LBNH18YEH_p6qrdchyhAwcMxxILF0JleBHhAXC_q20Y","y":"aE21SsBS2M5tQJj1yDjUWocqcmwMcvBK7MvhAfTHOMk"}`,
@@ -574,8 +611,10 @@ func TestVerifierFromJWK_VerifiesKnownSignature(t *testing.T) {
 	}
 }
 
+// rsaJWK is a 2048-bit RSA public key, a key type this package does not support.
+const rsaJWK = `{"kty":"RSA","n":"uteGojBE7QA0wW5aS6ALw-7q8EawPWOW-DHBVrmxaDvXuX4sLn2Gj-2ctRIV7paDnQnv4s-6aLMLiibjW8SbOg4555PCkFxvII5Vftw1EwDoliOEFX-kg0MVRlYgS1bSdPIx1-_WneiNUQC8GQf7Rqdud_e340VZU9r3Gaqt5VhQ9rlGUZQr5eOKNDCAD8PnuKQeDd7FzNaAb0_mdRqAzoK_gJfc1ntZAcxQsZ1dd0As8wrD1YdzuPnl_VEp0RcpHZErGS2_CfwAtAQjxk3ZPHzaWVXv8vFAdHKhV4kOEviRWCk2lucebr4I47RPQXmlJJzME7FhY1qPWO3gEyoosQ","e":"AQAB"}`
+
 func TestVerifierFromJWK_RSAUnsupported(t *testing.T) {
-	const rsaJWK = `{"kty":"RSA","n":"uteGojBE7QA0wW5aS6ALw-7q8EawPWOW-DHBVrmxaDvXuX4sLn2Gj-2ctRIV7paDnQnv4s-6aLMLiibjW8SbOg4555PCkFxvII5Vftw1EwDoliOEFX-kg0MVRlYgS1bSdPIx1-_WneiNUQC8GQf7Rqdud_e340VZU9r3Gaqt5VhQ9rlGUZQr5eOKNDCAD8PnuKQeDd7FzNaAb0_mdRqAzoK_gJfc1ntZAcxQsZ1dd0As8wrD1YdzuPnl_VEp0RcpHZErGS2_CfwAtAQjxk3ZPHzaWVXv8vFAdHKhV4kOEviRWCk2lucebr4I47RPQXmlJJzME7FhY1qPWO3gEyoosQ","e":"AQAB"}`
 	key, err := jwk.ParseKey([]byte(rsaJWK))
 	if err != nil {
 		t.Fatalf("ParseKey() error = %v", err)
@@ -589,14 +628,20 @@ func TestVerifierFromJWK_RSAUnsupported(t *testing.T) {
 	}
 }
 
-// extractKeyDIDDoc has one verification method for each case ExtractKey must handle.
-//   - key-1: JWK, referenced from assertionMethod by its absolute URL.
-//   - key-2: JWK, listed only under authentication.
-//   - key-3: no JWK, only publicKeyMultibase, referenced from assertionMethod.
+// assertionTestDIDDoc has one verification method for each case
+// GetAssertionVerifier must handle. Placeholders in braces are replaced with
+// keys from the test vectors above, so a returned verifier can be checked
+// against a known signature.
+//   - key-1: P-256 JWK, referenced from assertionMethod by its absolute URL.
+//   - key-2: Ed25519 JWK, listed only under authentication.
+//   - key-3: Ed25519 Multikey, referenced from assertionMethod.
 //   - key-4: malformed JWK, referenced from assertionMethod.
-//   - key-5: JWK embedded directly in assertionMethod.
-//   - key-6: JWK, referenced from assertionMethod by the relative URL "#key-6".
-const extractKeyDIDDoc = `{
+//   - key-5: Ed25519 JWK embedded directly in assertionMethod.
+//   - key-6: P-256 Multikey, referenced by the relative URL "#key-6".
+//   - key-8: only publicKeyBase58, which is not supported.
+//   - key-9: publicKeyMultibase that is not valid base58.
+//   - key-10: RSA JWK, a key type this package does not support.
+const assertionTestDIDDoc = `{
   "@context": "https://www.w3.org/ns/did/v1",
   "id": "did:web:example.com:user:101",
   "verificationMethod": [
@@ -604,19 +649,19 @@ const extractKeyDIDDoc = `{
       "id": "did:web:example.com:user:101#key-1",
       "type": "JsonWebKey2020",
       "controller": "did:web:example.com:user:101",
-      "publicKeyJwk": ` + extractKeyP256JWK + `
+      "publicKeyJwk": {P256_JWK}
     },
     {
       "id": "did:web:example.com:user:101#key-2",
       "type": "JsonWebKey2020",
       "controller": "did:web:example.com:user:101",
-      "publicKeyJwk": ` + extractKeyEd25519JWK + `
+      "publicKeyJwk": {ED25519_JWK}
     },
     {
       "id": "did:web:example.com:user:101#key-3",
       "type": "Multikey",
       "controller": "did:web:example.com:user:101",
-      "publicKeyMultibase": "z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2"
+      "publicKeyMultibase": "{ED25519_MULTIKEY}"
     },
     {
       "id": "did:web:example.com:user:101#key-4",
@@ -626,9 +671,27 @@ const extractKeyDIDDoc = `{
     },
     {
       "id": "did:web:example.com:user:101#key-6",
+      "type": "Multikey",
+      "controller": "did:web:example.com:user:101",
+      "publicKeyMultibase": "{P256_MULTIKEY}"
+    },
+    {
+      "id": "did:web:example.com:user:101#key-8",
+      "type": "Ed25519VerificationKey2018",
+      "controller": "did:web:example.com:user:101",
+      "publicKeyBase58": "B12NYF8RrR3h41TDCTJojY59usg3mbtbjnFs7Eud1Y6u"
+    },
+    {
+      "id": "did:web:example.com:user:101#key-9",
+      "type": "Multikey",
+      "controller": "did:web:example.com:user:101",
+      "publicKeyMultibase": "z0OIl"
+    },
+    {
+      "id": "did:web:example.com:user:101#key-10",
       "type": "JsonWebKey2020",
       "controller": "did:web:example.com:user:101",
-      "publicKeyJwk": ` + extractKeyEd25519JWK + `
+      "publicKeyJwk": {RSA_JWK}
     }
   ],
   "authentication": ["did:web:example.com:user:101#key-2"],
@@ -640,97 +703,204 @@ const extractKeyDIDDoc = `{
       "id": "did:web:example.com:user:101#key-5",
       "type": "JsonWebKey2020",
       "controller": "did:web:example.com:user:101",
-      "publicKeyJwk": ` + extractKeyP256JWK + `
+      "publicKeyJwk": {ED25519_JWK}
     },
-    "#key-6"
+    "#key-6",
+    "did:web:example.com:user:101#key-8",
+    "did:web:example.com:user:101#key-9",
+    "did:web:example.com:user:101#key-10"
   ]
 }`
 
-const (
-	extractKeyP256JWK    = `{"kty":"EC","crv":"P-256","x":"og9qNE10V4aSHCTMJFCAcciUfbUqk_pe4MXlqVqEEow","y":"NirPmr7CcLI6GVlNNCvOrA7YKfnj40VT8bEKMZ591QU"}`
-	extractKeyEd25519JWK = `{"kty":"OKP","crv":"Ed25519","x":"ht5vVxVpT5ZAWxOcNw_Odgrd3swyV8yeuph7Nr2d_tI"}`
-)
+// signedMessage is a message and a signature over it that a verifier for the
+// right key accepts. msg is what SigVerifier.verify takes, before its own hashing.
+type signedMessage struct {
+	msg []byte
+	sig []byte
+}
 
-func TestExtractKey(t *testing.T) {
-	doc, err := did.ParseDocument(extractKeyDIDDoc)
+// assertionTestVectors returns the known signatures for the keys used in
+// assertionTestDIDDoc, by vector name.
+func assertionTestVectors(t *testing.T) map[string]signedMessage {
+	t.Helper()
+	p256 := findECDSAVector(t, "P-256")
+	p256JWK := findJWKVector(t, "P-256")
+	ed25519JWK := findJWKVector(t, "Ed25519")
+	return map[string]signedMessage{
+		"P-256 JWK":        {msg: []byte(p256JWK.msg), sig: mustDecodeHex(t, p256JWK.sig)},
+		"Ed25519 JWK":      {msg: []byte(ed25519JWK.msg), sig: mustDecodeHex(t, ed25519JWK.sig)},
+		"P-256 Multikey":   {msg: mustDecodeHex(t, p256.digest), sig: mustDecodeHex(t, p256.sig)},
+		"Ed25519 Multikey": {msg: mustDecodeHex(t, ed25519Digest), sig: mustDecodeHex(t, ed25519Sig)},
+	}
+}
+
+func findJWKVector(t *testing.T, name string) jwkVector {
+	t.Helper()
+	for _, vec := range jwkVectors {
+		if vec.name == name {
+			return vec
+		}
+	}
+	t.Fatalf("test setup: no JWK vector named %s", name)
+	return jwkVector{}
+}
+
+func findECDSAVector(t *testing.T, name string) multikeyVector {
+	t.Helper()
+	for _, vec := range ecdsaJCSVectors {
+		if vec.name == name {
+			return vec
+		}
+	}
+	t.Fatalf("test setup: no ECDSA vector named %s", name)
+	return multikeyVector{}
+}
+
+func parseAssertionTestDIDDoc(t *testing.T) *did.Document {
+	t.Helper()
+	raw := strings.NewReplacer(
+		"{P256_JWK}", findJWKVector(t, "P-256").jwk,
+		"{ED25519_JWK}", findJWKVector(t, "Ed25519").jwk,
+		"{P256_MULTIKEY}", findECDSAVector(t, "P-256").key,
+		"{ED25519_MULTIKEY}", ed25519PublicKey,
+		"{RSA_JWK}", rsaJWK,
+	).Replace(assertionTestDIDDoc)
+	doc, err := did.ParseDocument(raw)
 	if err != nil {
 		t.Fatalf("ParseDocument: %v", err)
 	}
+	return doc
+}
+
+func TestGetAssertionVerifier(t *testing.T) {
+	doc := parseAssertionTestDIDDoc(t)
+	vectors := assertionTestVectors(t)
 	tests := []struct {
-		name    string
-		url     string
-		wantJWK string // set when ExtractKey must succeed
-		wantErr string // set when ExtractKey must fail
+		name     string
+		url      string
+		wantType SigType
+		vector   string
 	}{
-		{name: "assertion method reference", url: "did:web:example.com:user:101#key-1", wantJWK: extractKeyP256JWK},
-		{name: "embedded assertion method", url: "did:web:example.com:user:101#key-5", wantJWK: extractKeyP256JWK},
-		{name: "relative assertion method reference", url: "did:web:example.com:user:101#key-6", wantJWK: extractKeyEd25519JWK},
-		{name: "authentication only", url: "did:web:example.com:user:101#key-2", wantErr: "not found or not an assertion method"},
-		{name: "no JWK", url: "did:web:example.com:user:101#key-3", wantErr: "has no publicKeyJwk"},
-		{name: "malformed JWK", url: "did:web:example.com:user:101#key-4", wantErr: "could not parse public key"},
-		{name: "unknown fragment", url: "did:web:example.com:user:101#key-9", wantErr: "not found or not an assertion method"},
-		{name: "other DID", url: "did:web:other.example:user:101#key-1", wantErr: "not found or not an assertion method"},
-		{name: "no fragment", url: "did:web:example.com:user:101", wantErr: "not found or not an assertion method"},
+		{name: "JWK reference", url: "did:web:example.com:user:101#key-1", wantType: SigType_ECDSA, vector: "P-256 JWK"},
+		{name: "embedded JWK", url: "did:web:example.com:user:101#key-5", wantType: SigType_EDDSA, vector: "Ed25519 JWK"},
+		{name: "Multikey reference", url: "did:web:example.com:user:101#key-3", wantType: SigType_EDDSA, vector: "Ed25519 Multikey"},
+		{name: "relative Multikey reference", url: "did:web:example.com:user:101#key-6", wantType: SigType_ECDSA, vector: "P-256 Multikey"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			keyURL := did.MustParseDIDURL(tt.url)
-			key, err := ExtractKey(doc, &keyURL)
-			if tt.wantErr != "" {
-				if err == nil {
-					t.Fatalf("ExtractKey succeeded with key %v", key)
-				}
-				if key != nil {
-					t.Errorf("ExtractKey returned key %v with error", key)
-				}
-				if !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("error = %q, want substring %q", err, tt.wantErr)
-				}
-				return
-			}
+			verifier, err := GetAssertionVerifier(doc, &keyURL)
 			if err != nil {
-				t.Fatalf("ExtractKey: %v", err)
+				t.Fatalf("GetAssertionVerifier: %v", err)
 			}
-			requireSameJWK(t, key, tt.wantJWK)
+			if got := verifier.sigType(); got != tt.wantType {
+				t.Errorf("sigType = %v, want %v", got, tt.wantType)
+			}
+
+			vec := vectors[tt.vector]
+			ok, err := verifier.verify(vec.msg, vec.sig)
+			if err != nil {
+				t.Fatalf("verify: %v", err)
+			}
+			if !ok {
+				t.Fatal("verifier rejected the known signature for this key")
+			}
 		})
 	}
 }
 
-// A JWK error from go-did must be returned wrapped, not replaced.
-func TestExtractKey_WrapsJWKError(t *testing.T) {
-	doc, err := did.ParseDocument(extractKeyDIDDoc)
-	if err != nil {
-		t.Fatalf("ParseDocument: %v", err)
+func TestGetAssertionVerifier_Rejects(t *testing.T) {
+	doc := parseAssertionTestDIDDoc(t)
+	tests := []struct {
+		name string
+		url  string
+		want string
+	}{
+		{name: "authentication only", url: "did:web:example.com:user:101#key-2", want: "not found or not an assertion method"},
+		{name: "unknown fragment", url: "did:web:example.com:user:101#key-99", want: "not found or not an assertion method"},
+		{name: "other DID", url: "did:web:other.example:user:101#key-1", want: "not found or not an assertion method"},
+		{name: "no fragment", url: "did:web:example.com:user:101", want: "not found or not an assertion method"},
+		{name: "malformed JWK", url: "did:web:example.com:user:101#key-4", want: "could not parse public key"},
+		{name: "unsupported key format", url: "did:web:example.com:user:101#key-8", want: "has no publicKeyJwk or publicKeyMultibase"},
+		{name: "malformed Multikey", url: "did:web:example.com:user:101#key-9", want: "Could not make verifier for key did:web:example.com:user:101#key-9"},
+		{name: "unsupported JWK type", url: "did:web:example.com:user:101#key-10", want: "Unsupported key type"},
 	}
-	keyURL := did.MustParseDIDURL("did:web:example.com:user:101#key-4")
-	_, wantErr := doc.AssertionMethod.FindByID(keyURL).JWK()
-	if wantErr == nil {
-		t.Fatal("test setup: key-4 JWK parsed without error")
-	}
-
-	_, err = ExtractKey(doc, &keyURL)
-	if err == nil {
-		t.Fatal("ExtractKey succeeded")
-	}
-	if !strings.Contains(err.Error(), wantErr.Error()) {
-		t.Fatalf("error = %q, want it to contain the JWK error %q", err, wantErr)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			keyURL := did.MustParseDIDURL(tt.url)
+			requireAssertionVerifierError(t, doc, &keyURL, tt.want)
+		})
 	}
 }
 
-func TestExtractKey_NilInputs(t *testing.T) {
-	doc, err := did.ParseDocument(extractKeyDIDDoc)
-	if err != nil {
-		t.Fatalf("ParseDocument: %v", err)
+// Errors from go-did and from the key parsers must be wrapped, not replaced.
+func TestGetAssertionVerifier_WrapsKeyErrors(t *testing.T) {
+	doc := parseAssertionTestDIDDoc(t)
+	tests := []struct {
+		name    string
+		url     string
+		wantErr func(*did.VerificationMethod) error
+	}{
+		{
+			name: "JWK",
+			url:  "did:web:example.com:user:101#key-4",
+			wantErr: func(vm *did.VerificationMethod) error {
+				_, err := vm.JWK()
+				return err
+			},
+		},
+		{
+			name: "Multikey",
+			url:  "did:web:example.com:user:101#key-9",
+			wantErr: func(vm *did.VerificationMethod) error {
+				_, err := VerifierFromMultikey(vm.PublicKeyMultibase)
+				return err
+			},
+		},
 	}
-	keyURL := did.MustParseDIDURL("did:web:example.com:user:101#key-1")
-	missingURL := did.MustParseDIDURL("did:web:example.com:user:101#key-9")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			keyURL := did.MustParseDIDURL(tt.url)
+			wantErr := tt.wantErr(doc.AssertionMethod.FindByID(keyURL))
+			if wantErr == nil {
+				t.Fatalf("test setup: %s parsed without error", tt.url)
+			}
+			requireAssertionVerifierError(t, doc, &keyURL, wantErr.Error())
+		})
+	}
+}
 
-	// A document built in code, rather than parsed, can hold nil entries.
-	withNils := &did.Document{
-		ID:                 doc.ID,
-		VerificationMethod: did.VerificationMethods{nil},
-		AssertionMethod:    did.VerificationRelationships{{}},
+// go-did refuses to parse a verification method with two key formats, but a
+// document built in code can still hold one.
+func TestGetAssertionVerifier_RejectsTwoKeyFormats(t *testing.T) {
+	keyURL := did.MustParseDIDURL("did:web:example.com:user:101#key-1")
+	var jwkMap map[string]any
+	if err := json.Unmarshal([]byte(findJWKVector(t, "P-256").jwk), &jwkMap); err != nil {
+		t.Fatalf("unmarshal JWK: %v", err)
+	}
+	doc := &did.Document{ID: did.MustParseDID("did:web:example.com:user:101")}
+	doc.AddAssertionMethod(&did.VerificationMethod{
+		ID:                 keyURL,
+		Type:               "JsonWebKey2020",
+		Controller:         doc.ID,
+		PublicKeyJwk:       jwkMap,
+		PublicKeyMultibase: findECDSAVector(t, "P-256").key,
+	})
+	requireAssertionVerifierError(t, doc, &keyURL, "has both publicKeyJwk and publicKeyMultibase")
+}
+
+func TestGetAssertionVerifier_NilInputs(t *testing.T) {
+	doc := parseAssertionTestDIDDoc(t)
+	keyURL := did.MustParseDIDURL("did:web:example.com:user:101#key-1")
+
+	// A document built in code, rather than parsed, can hold an assertion
+	// method entry with no verification method.
+	withNilEntry := &did.Document{
+		ID:              doc.ID,
+		AssertionMethod: did.VerificationRelationships{{}},
 	}
 
 	tests := []struct {
@@ -743,40 +913,26 @@ func TestExtractKey_NilInputs(t *testing.T) {
 		{name: "nil key URL", doc: doc, url: nil, want: "No key URL"},
 		{name: "both nil", doc: nil, url: nil, want: "No DID document"},
 		{name: "empty document", doc: &did.Document{}, url: &keyURL, want: "not found or not an assertion method"},
-		{name: "nil entries", doc: withNils, url: &missingURL, want: "not found or not an assertion method"},
+		{name: "nil entry", doc: withNilEntry, url: &keyURL, want: "not found or not an assertion method"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			key, err := ExtractKey(tt.doc, tt.url)
-			if err == nil {
-				t.Fatalf("ExtractKey succeeded with key %v", key)
-			}
-			if key != nil {
-				t.Errorf("ExtractKey returned key %v with error", key)
-			}
-			if !strings.Contains(err.Error(), tt.want) {
-				t.Fatalf("error = %q, want substring %q", err, tt.want)
-			}
+			requireAssertionVerifierError(t, tt.doc, tt.url, tt.want)
 		})
 	}
 }
 
-func requireSameJWK(t *testing.T, got jwk.Key, wantJSON string) {
+func requireAssertionVerifierError(t *testing.T, doc *did.Document, keyURL *did.DIDURL, want string) {
 	t.Helper()
-	want, err := jwk.ParseKey([]byte(wantJSON))
-	if err != nil {
-		t.Fatalf("parse expected JWK: %v", err)
+	verifier, err := GetAssertionVerifier(doc, keyURL)
+	if err == nil {
+		t.Fatalf("GetAssertionVerifier succeeded with %T", verifier)
 	}
-	gotPrint, err := got.Thumbprint(crypto.SHA256)
-	if err != nil {
-		t.Fatalf("thumbprint of returned key: %v", err)
+	if verifier != nil {
+		t.Errorf("GetAssertionVerifier returned %T with error", verifier)
 	}
-	wantPrint, err := want.Thumbprint(crypto.SHA256)
-	if err != nil {
-		t.Fatalf("thumbprint of expected key: %v", err)
-	}
-	if !bytes.Equal(gotPrint, wantPrint) {
-		t.Fatalf("returned key %x, want %x", gotPrint, wantPrint)
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("error = %q, want substring %q", err, want)
 	}
 }

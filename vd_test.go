@@ -927,15 +927,11 @@ func TestVerifyDocFromDID(t *testing.T) {
 		t.Errorf("Proof DID does not match DID Doc, proof DID = %s, doc DID = %s", vd.Proof.VerificationMethod.DID.String(), didDoc.ID.String())
 	}
 
-	// Extract the key for the DID Doc and make a verifier.
+	// Get a verifier for the assertion key the proof names.
 	keyURL := vd.Proof.VerificationMethod
-	key, err := ExtractKey(didDoc, keyURL)
+	verifier, err := GetAssertionVerifier(didDoc, keyURL)
 	if err != nil {
-		t.Fatalf("Error extracting key: %s\nKey URL: %s", err, keyURL.String())
-	}
-	verifier, err := VerifierFromJWK(key)
-	if err != nil {
-		t.Fatalf("Error getting verifier for key: %s", err)
+		t.Fatalf("Error getting verifier: %s\nKey URL: %s", err, keyURL)
 	}
 
 	// Now verify the doc.
