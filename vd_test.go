@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"math/big"
 	"regexp"
@@ -614,13 +615,10 @@ func TestParseDoc_MalformedProof(t *testing.T) {
 func TestParseDoc_MalformedNonProofField(t *testing.T) {
 	// credentialSubject is not valid JSON. ParseDoc only decodes the top-level
 	// object and leaves every other field raw, so this still parses.
-	const document = `{
+	document := `{
 		"id": "urn:example:1",
 		"credentialSubject": "{not: valid}",
-		"proof": {
-			"type": "DataIntegrityProof",
-			"proofPurpose": "assertionMethod"
-		}
+		"proof": ` + proofJSON(t, validProofFields()) + `
 	}`
 
 	doc, err := ParseDoc([]byte(document))
@@ -688,7 +686,7 @@ func TestParseDoc_WrongTypeOrPurpose(t *testing.T) {
 		{
 			name:  "purpose",
 			proof: `{"type":"DataIntegrityProof","proofPurpose":"authentication"}`,
-			want:  "Unsupported proof type: DataIntegrityProof",
+			want:  "Unsupported proof purpose: authentication",
 		},
 	}
 	for _, tt := range tests {
@@ -699,8 +697,101 @@ func TestParseDoc_WrongTypeOrPurpose(t *testing.T) {
 	}
 }
 
+// ParseDoc requires every field that a Data Integrity proof must carry.
+// A value that is present but empty or null counts as missing.
+func TestParseDoc_MissingProofFields(t *testing.T) {
+	tests := []struct {
+		name   string
+		remove string
+		set    any // used instead of removing the field when not nil
+		want   string
+	}{
+		{name: "no type", remove: "type", want: "Unsupported proof type: "},
+		{name: "empty type", remove: "type", set: "", want: "Unsupported proof type: "},
+		{name: "no purpose", remove: "proofPurpose", want: "Unsupported proof purpose: "},
+		{name: "empty purpose", remove: "proofPurpose", set: "", want: "Unsupported proof purpose: "},
+		{name: "no cryptosuite", remove: "cryptosuite", want: "Proof has no cryptosuite"},
+		{name: "no verification method", remove: "verificationMethod", want: "Proof has no verificationMethod"},
+		{name: "null verification method", remove: "verificationMethod", set: json.RawMessage("null"), want: "Proof has no verificationMethod"},
+		{name: "no proof value", remove: "proofValue", want: "Proof has no proofValue"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fields := validProofFields()
+			delete(fields, tt.remove)
+			if tt.set != nil {
+				fields[tt.remove] = tt.set
+			}
+			requireParseDocError(t, docWithProof(proofJSON(t, fields)), tt.want)
+		})
+	}
+}
+
+// The checks above must not reject a proof that has every required field.
+func TestParseDoc_MinimalValidProof(t *testing.T) {
+	doc := mustParseCredential(t, docWithProof(proofJSON(t, validProofFields())))
+	if doc.Proof.CryptoSuite != CryptoSuite_ECDSA_JCS_2019 {
+		t.Errorf("cryptosuite = %s, want ecdsa-jcs-2019", doc.Proof.CryptoSuite)
+	}
+	if doc.Proof.VerificationMethod == nil {
+		t.Fatal("verification method is nil")
+	}
+	if got := doc.Proof.VerificationMethod.String(); got != "did:web:example.com:user:101#key-1" {
+		t.Errorf("verification method = %s", got)
+	}
+	if len(doc.Proof.ProofValue) == 0 {
+		t.Error("proof value is empty")
+	}
+}
+
+// Sign must refuse to produce a doc that ParseDoc would reject.
+func TestSign_RejectsInvalidProofConfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Proof)
+		want   string
+	}{
+		{name: "wrong type", mutate: func(p *Proof) { p.ProofType = "Ed25519Signature2020" }, want: "Unsupported proof type: Ed25519Signature2020"},
+		{name: "empty type", mutate: func(p *Proof) { p.ProofType = "" }, want: "Unsupported proof type: "},
+		{name: "wrong purpose", mutate: func(p *Proof) { p.ProofPurpose = "authentication" }, want: "Unsupported proof purpose: authentication"},
+		{name: "empty purpose", mutate: func(p *Proof) { p.ProofPurpose = "" }, want: "Unsupported proof purpose: "},
+		{name: "no verification method", mutate: func(p *Proof) { p.VerificationMethod = nil }, want: "Proof has no verificationMethod"},
+	}
+	signer := mustECDSASigner(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuite_ECDSA_JCS_2019)
+			tt.mutate(&vd.Proof)
+			requireSignError(t, &vd, signer, tt.want)
+		})
+	}
+}
+
 func docWithProof(proof string) string {
 	return `{"id":"urn:example:1","proof":` + proof + `}`
+}
+
+// validProofFields returns the fields of a proof that ParseDoc accepts.
+// The proof value is a placeholder and will not verify.
+func validProofFields() map[string]any {
+	return map[string]any{
+		"type":               "DataIntegrityProof",
+		"proofPurpose":       "assertionMethod",
+		"cryptosuite":        "ecdsa-jcs-2019",
+		"verificationMethod": "did:web:example.com:user:101#key-1",
+		"proofValue":         "z1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+	}
+}
+
+func proofJSON(t *testing.T, fields map[string]any) string {
+	t.Helper()
+	proof, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("marshal proof: %v", err)
+	}
+	return string(proof)
 }
 
 func requireParseDocError(t *testing.T, document, want string) {
@@ -1038,30 +1129,31 @@ func TestSign_DefaultTimestampFormat(t *testing.T) {
 func TestParseDoc_ProofTimestamps(t *testing.T) {
 	tests := []struct {
 		name        string
-		proof       string
+		times       map[string]any
 		wantCreated time.Time
 		wantExpires time.Time
 	}{
 		{
 			name:        "created and expires",
-			proof:       `{"type":"DataIntegrityProof","proofPurpose":"assertionMethod","created":"2026-03-28T15:40:00Z","expires":"2027-03-28T15:40:00Z"}`,
+			times:       map[string]any{"created": "2026-03-28T15:40:00Z", "expires": "2027-03-28T15:40:00Z"},
 			wantCreated: time.Date(2026, 3, 28, 15, 40, 0, 0, time.UTC),
 			wantExpires: time.Date(2027, 3, 28, 15, 40, 0, 0, time.UTC),
 		},
 		{
 			name:        "offset and fractional seconds",
-			proof:       `{"type":"DataIntegrityProof","proofPurpose":"assertionMethod","created":"2026-10-06T15:06:41.070247+08:00"}`,
+			times:       map[string]any{"created": "2026-10-06T15:06:41.070247+08:00"},
 			wantCreated: time.Date(2026, 10, 6, 7, 6, 41, 70247000, time.UTC),
 		},
 		{
-			name:  "absent",
-			proof: `{"type":"DataIntegrityProof","proofPurpose":"assertionMethod"}`,
+			name: "absent",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			doc := mustParseCredential(t, docWithProof(tt.proof))
+			fields := validProofFields()
+			maps.Copy(fields, tt.times)
+			doc := mustParseCredential(t, docWithProof(proofJSON(t, fields)))
 			if !doc.Proof.Created.Equal(tt.wantCreated) {
 				t.Errorf("created = %s, want %s", doc.Proof.Created, tt.wantCreated)
 			}

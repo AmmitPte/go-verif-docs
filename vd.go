@@ -123,11 +123,11 @@ func ParseDoc(data []byte) (VerifiableDoc, error) {
 	if err := json.Unmarshal(rawProof, &proof); err != nil {
 		return VerifiableDoc{}, fmt.Errorf("Error parsing doc proof: %w", err)
 	}
-	if proof.ProofType != "DataIntegrityProof" {
-		return VerifiableDoc{}, fmt.Errorf("Unsupported proof type: %s", proof.ProofType)
+	if err := checkProofConfig(proof); err != nil {
+		return VerifiableDoc{}, err
 	}
-	if proof.ProofPurpose != "assertionMethod" {
-		return VerifiableDoc{}, fmt.Errorf("Unsupported proof type: %s", proof.ProofType)
+	if len(proof.ProofValue) == 0 {
+		return VerifiableDoc{}, fmt.Errorf("Proof has no proofValue")
 	}
 	delete(document, "proof")
 
@@ -155,6 +155,26 @@ func ParseDoc(data []byte) (VerifiableDoc, error) {
 		Proof:           proof,
 		rawProofOptions: proofBytes,
 	}, nil
+}
+
+// checkProofConfig checks the proof fields that every proof must have before
+// it is signed or after it is parsed. It does not look at the proof value.
+// The cryptosuite can only be unknown here when the field is missing, because
+// unmarshalling rejects any suite name it does not recognise.
+func checkProofConfig(p Proof) error {
+	if p.ProofType != "DataIntegrityProof" {
+		return fmt.Errorf("Unsupported proof type: %s", p.ProofType)
+	}
+	if p.ProofPurpose != "assertionMethod" {
+		return fmt.Errorf("Unsupported proof purpose: %s", p.ProofPurpose)
+	}
+	if p.CryptoSuite == CryptoSuite_Unknown {
+		return fmt.Errorf("Proof has no cryptosuite")
+	}
+	if p.VerificationMethod == nil {
+		return fmt.Errorf("Proof has no verificationMethod")
+	}
+	return nil
 }
 
 // Get the hash of the doc appropriate for cryptosuite.
@@ -243,6 +263,10 @@ func (vd *VerifiableDoc) Sign(signer Signer) ([]byte, error) {
 	cs := vd.Proof.CryptoSuite
 	if !cs.MatchesSigType(signer.sigType()) {
 		return []byte{}, fmt.Errorf("Signer type %s does not match cryptosuite %s", signer.sigType(), cs)
+	}
+	// Refuse to sign a proof that ParseDoc would reject.
+	if err := checkProofConfig(vd.Proof); err != nil {
+		return []byte{}, err
 	}
 
 	// Make sure we get rid of the proof value to overwrite it.
