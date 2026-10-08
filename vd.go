@@ -388,9 +388,6 @@ func (d SignedDoc) VerifyAt(verifier SigVerifier, at time.Time) error {
 // with an @context is JSON-LD: Sign appends DataIntegrityContext to it unless
 // it already includes DataIntegrityContext or CredentialsV2Context, and copies
 // the result into the proof, as the JCS cryptosuites require.
-//
-// Before returning, Sign checks the new signature with the signer's public
-// key, so the result is known to verify.
 func Sign(body any, opts ProofOptions, signer Signer) (SignedDoc, error) {
 	if signer == nil {
 		return SignedDoc{}, errors.New("no signer given")

@@ -300,6 +300,133 @@ func TestECDSASigner_InvalidSigningKey(t *testing.T) {
 	}
 }
 
+func TestNewECDSASigner(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	signer, err := NewECDSASigner(key)
+	if err != nil {
+		t.Fatalf("NewECDSASigner: %v", err)
+	}
+	msg := []byte("canonical-bytes")
+	sig, err := signer.Sign(msg)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	requireSigVerifies(t, signer.Verifier(), msg, sig)
+}
+
+func TestNewECDSASigner_RejectsMissingKey(t *testing.T) {
+	for name, key := range map[string]*ecdsa.PrivateKey{"nil": nil, "zero": {}} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			signer, err := NewECDSASigner(key)
+			requireErrorContains(t, err, "no ECDSA private key given")
+			if signer != nil {
+				t.Errorf("signer = %#v, want nil", signer)
+			}
+		})
+	}
+}
+
+func TestNewECDSAVerifier(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	verifier, err := NewECDSAVerifier(&key.PublicKey)
+	if err != nil {
+		t.Fatalf("NewECDSAVerifier: %v", err)
+	}
+	msg := []byte("canonical-bytes")
+	sig, err := (&ECDSASigner{signKey: *key}).Sign(msg)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	requireSigVerifies(t, verifier, msg, sig)
+}
+
+func TestNewECDSAVerifier_RejectsMissingKey(t *testing.T) {
+	for name, key := range map[string]*ecdsa.PublicKey{"nil": nil, "zero": {}} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			verifier, err := NewECDSAVerifier(key)
+			requireErrorContains(t, err, "no ECDSA public key given")
+			if verifier != nil {
+				t.Errorf("verifier = %#v, want nil", verifier)
+			}
+		})
+	}
+}
+
+// customCurve wraps P-256 in another type, so crypto/ecdsa treats it as a
+// curve it does not support.
+type customCurve struct{ elliptic.Curve }
+
+func TestNewECDSAKeys_RejectUnsupportedCurve(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	key.Curve = customCurve{key.Curve}
+
+	signer, err := NewECDSASigner(key)
+	requireErrorContains(t, err, "invalid ECDSA private key")
+	if signer != nil {
+		t.Errorf("signer = %#v, want nil", signer)
+	}
+	verifier, err := NewECDSAVerifier(&key.PublicKey)
+	requireErrorContains(t, err, "invalid ECDSA public key")
+	if verifier != nil {
+		t.Errorf("verifier = %#v, want nil", verifier)
+	}
+}
+
+// The zero values of the exported key types have no key. Using them must
+// return an error rather than panic.
+func TestZeroValueKeys(t *testing.T) {
+	data := []byte("canonical-bytes")
+	verifiers := map[string]SigVerifier{
+		"ECDSAVerifier":         ECDSAVerifier{},
+		"EDDSAVerifier":         EDDSAVerifier{},
+		"ECDSASigner.Verifier":  ECDSASigner{}.Verifier(),
+		"*ECDSAVerifier":        &ECDSAVerifier{},
+		"ECDSAVerifier nil key": ECDSAVerifier{pubKey: &ecdsa.PublicKey{}},
+	}
+	for name, verifier := range verifiers {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ok, err := verifier.Verify(data, make([]byte, 64))
+			requireErrorContains(t, err, "verifier has no public key")
+			if ok {
+				t.Error("verify accepted a signature with no key")
+			}
+			verifier.Hash(data)
+
+			vd := vectorDoc(t, vectorP256)
+			if verifier.SigType() == SigTypeEDDSA {
+				vd = vectorDoc(t, vectorEd25519)
+			}
+			requireErrorContains(t, vd.Verify(verifier), "verifier has no public key")
+		})
+	}
+
+	t.Run("ECDSASigner", func(t *testing.T) {
+		t.Parallel()
+		var signer ECDSASigner
+		sig, err := signer.Sign(data)
+		requireErrorContains(t, err, "ECDSA signer has no private key")
+		if sig != nil {
+			t.Errorf("signature = %x, want none", sig)
+		}
+		if h := signer.Hash(data); h != nil {
+			t.Errorf("hash = %x, want nil", h)
+		}
+		requireSignError(t, sampleDoc(), testProofOptions(CryptoSuiteECDSAJCS2019), signer, "ECDSA signer has no private key")
+	})
+}
+
 // --- JWK verifiers ---
 
 // jwkVector is a public JWK and a signature over msg made with the matching

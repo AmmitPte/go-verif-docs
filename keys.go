@@ -80,13 +80,37 @@ func hashForCurve(curve elliptic.Curve, data []byte) []byte {
 }
 
 // ECDSAVerifier verifies ECDSA signatures with a P-256, P-384 or P-521 key.
+// Make one with NewECDSAVerifier or ECDSAVerifierFromBytes. The zero value
+// has no key and rejects every signature with an error.
 type ECDSAVerifier struct {
 	pubKey *ecdsa.PublicKey
+}
+
+// NewECDSAVerifier returns a verifier for pub. The key must be a valid point
+// on a curve that crypto/ecdsa supports.
+func NewECDSAVerifier(pub *ecdsa.PublicKey) (*ECDSAVerifier, error) {
+	if pub == nil || pub.Curve == nil {
+		return nil, errors.New("no ECDSA public key given")
+	}
+	// Bytes fails for a point that is not on the curve.
+	if _, err := pub.Bytes(); err != nil {
+		return nil, fmt.Errorf("invalid ECDSA public key: %w", err)
+	}
+	return &ECDSAVerifier{pubKey: pub}, nil
+}
+
+// hasKey reports whether v was made with a key, rather than being the zero
+// value.
+func (v ECDSAVerifier) hasKey() bool {
+	return v.pubKey != nil && v.pubKey.Curve != nil
 }
 
 // Verify checks an IEEE P1363 signature: r followed by s, each the size of a
 // curve coordinate.
 func (v ECDSAVerifier) Verify(data []byte, sig []byte) (bool, error) {
+	if !v.hasKey() {
+		return false, errors.New("ECDSA verifier has no public key")
+	}
 	size := fieldBytes(v.pubKey.Curve)
 	if len(sig) != 2*size {
 		return false, fmt.Errorf("wrong signature size: got %d bytes, want %d", len(sig), 2*size)
@@ -96,7 +120,11 @@ func (v ECDSAVerifier) Verify(data []byte, sig []byte) (bool, error) {
 	return ecdsa.Verify(v.pubKey, v.Hash(data), r, s), nil
 }
 
+// Hash returns nil for the zero value, which has no curve to choose a hash.
 func (v ECDSAVerifier) Hash(data []byte) []byte {
+	if !v.hasKey() {
+		return nil
+	}
 	return hashForCurve(v.pubKey.Curve, data)
 }
 
@@ -104,9 +132,23 @@ func (v ECDSAVerifier) SigType() SigType {
 	return SigTypeECDSA
 }
 
-// ECDSASigner signs with an ECDSA private key.
+// ECDSASigner signs with an ECDSA private key. Make one with NewECDSASigner
+// or GenerateECDSASigner. The zero value has no key and fails to sign.
 type ECDSASigner struct {
 	signKey ecdsa.PrivateKey
+}
+
+// NewECDSASigner returns a signer for key. The key must be valid on a curve
+// that crypto/ecdsa supports. The signer keeps a copy of key.
+func NewECDSASigner(key *ecdsa.PrivateKey) (*ECDSASigner, error) {
+	if key == nil || key.Curve == nil {
+		return nil, errors.New("no ECDSA private key given")
+	}
+	// Bytes fails for a scalar out of range or a public point not on the curve.
+	if _, err := key.Bytes(); err != nil {
+		return nil, fmt.Errorf("invalid ECDSA private key: %w", err)
+	}
+	return &ECDSASigner{signKey: *key}, nil
 }
 
 // GenerateECDSASigner returns a signer with a new random key on curve.
@@ -118,9 +160,18 @@ func GenerateECDSASigner(curve elliptic.Curve) (*ECDSASigner, error) {
 	return &ECDSASigner{signKey: *key}, nil
 }
 
+// hasKey reports whether signer was made with a key, rather than being the
+// zero value.
+func (signer ECDSASigner) hasKey() bool {
+	return signer.signKey.Curve != nil
+}
+
 // Sign returns an IEEE P1363 signature, r followed by s, as the ECDSA
 // cryptosuites require.
 func (signer ECDSASigner) Sign(data []byte) ([]byte, error) {
+	if !signer.hasKey() {
+		return nil, errors.New("ECDSA signer has no private key")
+	}
 	r, s, err := ecdsa.Sign(rand.Reader, &signer.signKey, signer.Hash(data))
 	if err != nil {
 		return nil, fmt.Errorf("signing: %w", err)
@@ -132,7 +183,11 @@ func (signer ECDSASigner) Sign(data []byte) ([]byte, error) {
 	return sig, nil
 }
 
+// Hash returns nil for the zero value, which has no curve to choose a hash.
 func (signer ECDSASigner) Hash(data []byte) []byte {
+	if !signer.hasKey() {
+		return nil
+	}
 	return hashForCurve(signer.signKey.Curve, data)
 }
 
@@ -144,7 +199,9 @@ func (signer ECDSASigner) Verifier() SigVerifier {
 	return ECDSAVerifier{pubKey: &signer.signKey.PublicKey}
 }
 
-// EDDSAVerifier verifies Ed25519 signatures.
+// EDDSAVerifier verifies Ed25519 signatures. Make one with
+// EDDSAVerifierFromBytes. The zero value has no key and rejects every
+// signature with an error.
 type EDDSAVerifier struct {
 	pubKey ed25519.PublicKey
 }
@@ -152,6 +209,10 @@ type EDDSAVerifier struct {
 // Verify checks a PureEdDSA (Ed25519) signature. Ed25519 hashes data itself,
 // with SHA-512.
 func (v EDDSAVerifier) Verify(data []byte, sig []byte) (bool, error) {
+	// ed25519.Verify panics on a key of the wrong length.
+	if len(v.pubKey) != ed25519.PublicKeySize {
+		return false, errors.New("EdDSA verifier has no public key")
+	}
 	if len(sig) != ed25519.SignatureSize {
 		return false, fmt.Errorf("wrong signature size: got %d bytes, want %d", len(sig), ed25519.SignatureSize)
 	}
@@ -247,11 +308,21 @@ func VerifierFromJWK(key jwk.Key) (SigVerifier, error) {
 	if err := jwk.Export(key, &raw); err != nil {
 		return nil, fmt.Errorf("exporting JWK: %w", err)
 	}
+	// As in VerifierFromMultikey, check each constructor's error so a nil
+	// pointer is never returned inside a non-nil SigVerifier.
 	switch pub := raw.(type) {
 	case *ecdsa.PublicKey:
-		return &ECDSAVerifier{pubKey: pub}, nil
+		v, err := NewECDSAVerifier(pub)
+		if err != nil {
+			return nil, err
+		}
+		return v, nil
 	case ed25519.PublicKey:
-		return &EDDSAVerifier{pubKey: pub}, nil
+		v, err := EDDSAVerifierFromBytes(pub)
+		if err != nil {
+			return nil, err
+		}
+		return v, nil
 	default:
 		return nil, fmt.Errorf("unsupported key type %s", key.KeyType())
 	}
