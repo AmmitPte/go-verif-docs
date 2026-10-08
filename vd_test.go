@@ -308,15 +308,53 @@ func replaceOnce(t *testing.T, b []byte, old, new string) []byte {
 	return bytes.Replace(b, []byte(old), []byte(new), 1)
 }
 
-// The W3C vectors carry an @context in their proofs, as the JCS cryptosuite
-// specifications require. This package does not accept that.
-func TestW3CVectors_ParseDocRejectsProofContext(t *testing.T) {
+// ParseDoc keeps the copy of the credential's @context that each vector's
+// proof carries, and gives Body that same @context.
+func TestW3CVectors_ProofContext(t *testing.T) {
+	const want = `["https://www.w3.org/ns/credentials/v2","https://www.w3.org/ns/credentials/examples/v2"]`
 	for _, vec := range w3cVectors {
 		t.Run(vec.name, func(t *testing.T) {
 			t.Parallel()
-			requireParseDocError(t, vec.signed(), "proof must not have an @context")
+			vd := vectorDoc(t, vec)
+			if got := string(mustCompact(t, vd.Proof.Context)); got != want {
+				t.Errorf("Proof.Context = %s, want %s", got, want)
+			}
+			var body map[string]json.RawMessage
+			mustUnmarshal(t, vd.Body, &body)
+			if got := string(mustCompact(t, body["@context"])); got != want {
+				t.Errorf("Body @context = %s, want %s", got, want)
+			}
 		})
 	}
+}
+
+// The proof's @context is signed. Changing it along with the document's gives
+// a doc that parses but does not verify, and changing only the document's
+// gives one that does not parse.
+func TestW3CVectors_RejectContextChanges(t *testing.T) {
+	const examples = `"https://www.w3.org/ns/credentials/examples/v2"`
+	for _, vec := range w3cVectors {
+		t.Run(vec.name+"/both", func(t *testing.T) {
+			t.Parallel()
+			signed := bytes.ReplaceAll([]byte(vec.signed()), []byte(examples), []byte(`"https://example.com/other"`))
+			requireErrorIs(t, mustParseDoc(t, signed).Verify(mustVerifier(t, vec.publicKey)), ErrInvalidSignature)
+		})
+		t.Run(vec.name+"/document only", func(t *testing.T) {
+			t.Parallel()
+			signed := replaceOnce(t, []byte(vec.signed()), examples, examples+`,"https://example.com/other"`)
+			requireParseDocError(t, string(signed), "document @context does not match proof @context")
+		})
+	}
+}
+
+// mustCompact returns data without insignificant whitespace.
+func mustCompact(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, data); err != nil {
+		t.Fatalf("json.Compact: %v", err)
+	}
+	return buf.Bytes()
 }
 
 // --- ParseDoc ---
@@ -423,24 +461,54 @@ func TestParseDoc_RejectsMalformed(t *testing.T) {
 	}
 }
 
-// The @context belongs on the document only, so any @context on the proof
-// is rejected, even an empty or null one.
-func TestParseDoc_RejectsProofContext(t *testing.T) {
+// When the proof has an @context, the document's must be the same JSON, so
+// that the whole @context is signed. Only the JCS canonical forms are
+// compared, so key order and whitespace do not matter.
+func TestParseDoc_Context(t *testing.T) {
+	const (
+		v2       = "https://www.w3.org/ns/credentials/v2"
+		examples = "https://www.w3.org/ns/credentials/examples/v2"
+	)
+	inline := map[string]any{"name": "https://schema.org/name", "age": "https://schema.org/age"}
+	reordered := json.RawMessage(`{"age":"https://schema.org/age","name":"https://schema.org/name"}`)
 	tests := []struct {
-		name    string
-		context any
+		name         string
+		docContext   any    // nil means absent
+		proofContext any    // nil means absent
+		want         string // empty means ParseDoc succeeds
+		wantBody     string // the @context in Body when ParseDoc succeeds; empty means absent
 	}{
-		{name: "array", context: []any{"https://www.w3.org/ns/credentials/v2"}},
-		{name: "string", context: DataIntegrityContext},
-		{name: "empty array", context: []any{}},
-		{name: "null", context: nil},
+		{name: "neither"},
+		{name: "document only", docContext: v2, wantBody: `"` + v2 + `"`},
+		{name: "proof only", proofContext: v2, want: "does not match"},
+		{name: "same string", docContext: v2, proofContext: v2, wantBody: `"` + v2 + `"`},
+		{name: "same array", docContext: []any{v2, examples}, proofContext: []any{v2, examples}, wantBody: `["` + v2 + `","` + examples + `"]`},
+		{name: "object key order", docContext: []any{v2, inline}, proofContext: []any{v2, reordered}, wantBody: `["` + v2 + `",{"age":"https://schema.org/age","name":"https://schema.org/name"}]`},
+		{name: "string and array of one", docContext: v2, proofContext: []any{v2}, want: "does not match"},
+		{name: "proof null", docContext: v2, proofContext: json.RawMessage("null"), want: "does not match"},
+		{name: "different", docContext: v2, proofContext: examples, want: "does not match"},
+		{name: "reordered", docContext: []any{examples, v2}, proofContext: []any{v2, examples}, want: "does not match"},
+		{name: "extra in document", docContext: []any{v2, examples}, proofContext: []any{v2}, want: "does not match"},
+		{name: "extra in proof", docContext: []any{v2}, proofContext: []any{v2, examples}, want: "does not match"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			fields := validProofFields()
-			fields["@context"] = tt.context
-			requireParseDocError(t, docWithProof(t, fields), "proof must not have an @context")
+			proof := validProofFields()
+			if tt.proofContext != nil {
+				proof["@context"] = tt.proofContext
+			}
+			doc := map[string]any{"id": "urn:example:1", "proof": proof}
+			if tt.docContext != nil {
+				doc["@context"] = tt.docContext
+			}
+			if tt.want != "" {
+				requireParseDocError(t, string(mustMarshal(t, doc)), tt.want)
+				return
+			}
+			var body map[string]json.RawMessage
+			mustUnmarshal(t, mustParseDoc(t, mustMarshal(t, doc)).Body, &body)
+			requireRawField(t, body, "@context", tt.wantBody)
 		})
 	}
 }
@@ -614,8 +682,7 @@ func TestSign_MatchesParsedDoc(t *testing.T) {
 		t.Errorf("hash data = %x, ParseDoc gives %x", signedData, parsedData)
 	}
 
-	// Body is the signed document without its proof, including the Data
-	// Integrity context that Sign added.
+	// Body is the signed document without its proof.
 	document, _ := signedFields(t, signed.Raw)
 	delete(document, "proof")
 	if want := mustMarshal(t, document); !bytes.Equal(signed.Body, want) {
@@ -623,24 +690,32 @@ func TestSign_MatchesParsedDoc(t *testing.T) {
 	}
 }
 
-func TestSign_AddsDataIntegrityContext(t *testing.T) {
-	const v2 = "https://www.w3.org/ns/credentials/v2"
+// Sign leaves plain JSON without an @context. It makes sure a JSON-LD
+// document's @context defines the Data Integrity terms, and copies it into
+// the proof.
+func TestSign_Context(t *testing.T) {
+	const (
+		v2       = CredentialsV2Context
+		examples = "https://www.w3.org/ns/credentials/examples/v2"
+		as       = "https://www.w3.org/ns/activitystreams"
+	)
 	tests := []struct {
 		name        string
-		context     any // nil means the doc has no @context
-		wantContext string
+		context     any    // nil means the doc has no @context
+		wantContext string // empty means absent from document and proof
 	}{
-		{name: "absent", wantContext: `["` + DataIntegrityContext + `"]`},
-		{name: "null", context: json.RawMessage("null"), wantContext: `["` + DataIntegrityContext + `"]`},
-		{name: "string", context: v2, wantContext: `["` + v2 + `","` + DataIntegrityContext + `"]`},
-		{name: "array", context: []any{v2}, wantContext: `["` + v2 + `","` + DataIntegrityContext + `"]`},
+		{name: "absent"},
+		{name: "other string", context: as, wantContext: `["` + as + `","` + DataIntegrityContext + `"]`},
+		{name: "other array", context: []any{as}, wantContext: `["` + as + `","` + DataIntegrityContext + `"]`},
 		{
 			name:        "array with object",
-			context:     []any{v2, map[string]any{"name": "https://schema.org/name"}},
-			wantContext: `["` + v2 + `",{"name":"https://schema.org/name"},"` + DataIntegrityContext + `"]`,
+			context:     []any{as, map[string]any{"name": "https://schema.org/name"}},
+			wantContext: `["` + as + `",{"name":"https://schema.org/name"},"` + DataIntegrityContext + `"]`,
 		},
+		{name: "credentials v2 string", context: v2, wantContext: `"` + v2 + `"`},
+		{name: "credentials v2 array", context: []any{v2, examples}, wantContext: `["` + v2 + `","` + examples + `"]`},
 		{name: "already the string", context: DataIntegrityContext, wantContext: `"` + DataIntegrityContext + `"`},
-		{name: "already in the array", context: []any{DataIntegrityContext, v2}, wantContext: `["` + DataIntegrityContext + `","` + v2 + `"]`},
+		{name: "already in the array", context: []any{as, DataIntegrityContext}, wantContext: `["` + as + `","` + DataIntegrityContext + `"]`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -650,13 +725,16 @@ func TestSign_AddsDataIntegrityContext(t *testing.T) {
 				doc["@context"] = tt.context
 			}
 			signer := mustECDSASigner(t)
-			signed := mustSign(t, doc, testProofOptions(CryptoSuiteECDSAJCS2019), signer).Raw
+			signed := mustSign(t, doc, testProofOptions(CryptoSuiteECDSAJCS2019), signer)
 
-			document, proof := signedFields(t, signed)
+			document, proof := signedFields(t, signed.Raw)
 			requireRawField(t, document, "@context", tt.wantContext)
-			requireRawField(t, proof, "@context", "")
+			requireRawField(t, proof, "@context", tt.wantContext)
+			if got := string(signed.Proof.Context); got != tt.wantContext {
+				t.Errorf("Proof.Context = %s, want %s", got, tt.wantContext)
+			}
 
-			requireNoError(t, mustParseDoc(t, signed).Verify(signer.verifier()))
+			requireNoError(t, mustParseDoc(t, signed.Raw).Verify(signer.verifier()))
 		})
 	}
 }

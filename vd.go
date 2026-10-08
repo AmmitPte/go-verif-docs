@@ -12,9 +12,14 @@ import (
 	"github.com/nuts-foundation/go-did/did"
 )
 
-// DataIntegrityContext is the JSON-LD context that defines Data Integrity
-// proofs. Sign adds it to the @context of every document it signs.
-const DataIntegrityContext = "https://w3id.org/security/data-integrity/v2"
+// JSON-LD contexts that define the Data Integrity terms a proof uses. Sign
+// adds DataIntegrityContext to a document's @context unless it already
+// includes one of these. CredentialsV2Context, the base context of a
+// Verifiable Credential, includes the Data Integrity terms.
+const (
+	DataIntegrityContext = "https://w3id.org/security/data-integrity/v2"
+	CredentialsV2Context = "https://www.w3.org/ns/credentials/v2"
+)
 
 // The only proof type and purpose this package signs or accepts.
 const (
@@ -128,9 +133,13 @@ func NewProofOptions(cs CryptoSuiteType, vm *did.DIDURL) ProofOptions {
 	}
 }
 
-// Proof is a Data Integrity proof, as found in a SignedDoc. A proof never has
-// its own @context; the document's @context applies to it.
+// Proof is a Data Integrity proof, as found in a SignedDoc.
+//
+// As the JCS cryptosuites require, a proof's Context is a copy of the
+// document's @context, so that the context is signed. A document without an
+// @context, such as plain JSON, has a proof without one.
 type Proof struct {
+	Context            json.RawMessage `json:"@context,omitempty"`
 	ProofType          string          `json:"type"`
 	ProofPurpose       string          `json:"proofPurpose"`
 	CryptoSuite        CryptoSuiteType `json:"cryptosuite"`
@@ -168,8 +177,12 @@ type SignedDoc struct {
 // checks that the document and its proof are well formed, but not the
 // signature or the proof's validity period. Use Verify for those.
 //
-// The proof must be a DataIntegrityProof for assertionMethod, and must not
-// have its own @context.
+// The proof must be a DataIntegrityProof for assertionMethod. If it has an
+// @context, it must be exactly the document's @context. The JCS cryptosuites
+// allow a document to add contexts after the proof's, but that only arises
+// with sets of proofs, which this package does not support.
+//
+// ParseDoc does not check that the @context is one the caller expects.
 //
 // The returned doc's Raw is data itself, not a copy.
 func ParseDoc(data []byte) (SignedDoc, error) {
@@ -207,10 +220,13 @@ func ParseDoc(data []byte) (SignedDoc, error) {
 	if err := json.Unmarshal(rawProof, &proofOptions); err != nil {
 		return SignedDoc{}, fmt.Errorf("parsing proof: %w", err)
 	}
-	if _, ok := proofOptions["@context"]; ok {
-		return SignedDoc{}, errors.New("proof must not have an @context")
-	}
 	delete(proofOptions, "proofValue")
+
+	// A proof without an @context is allowed even when the document has one.
+	// The document's @context is then covered by the body hash.
+	if proofContext, ok := proofOptions["@context"]; ok && !sameJSON(document["@context"], proofContext) {
+		return SignedDoc{}, errors.New("document @context does not match proof @context")
+	}
 
 	body, err := json.Marshal(document)
 	if err != nil {
@@ -363,10 +379,15 @@ func (d SignedDoc) VerifyAt(verifier SigVerifier, at time.Time) error {
 	return d.Proof.checkValidAt(at)
 }
 
-// Sign encodes body as JSON, adds DataIntegrityContext to its @context, and
-// signs it with a proof made from opts. body must encode to a JSON object
-// that has no proof. To sign JSON that is already encoded, pass it as a
-// json.RawMessage; a plain []byte encodes as a base64 string.
+// Sign encodes body as JSON and signs it with a proof made from opts. body
+// must encode to a JSON object that has no proof. To sign JSON that is
+// already encoded, pass it as a json.RawMessage; a plain []byte encodes as a
+// base64 string.
+//
+// A body without an @context, such as plain JSON, is signed as it is. A body
+// with an @context is JSON-LD: Sign appends DataIntegrityContext to it unless
+// it already includes DataIntegrityContext or CredentialsV2Context, and copies
+// the result into the proof, as the JCS cryptosuites require.
 //
 // Before returning, Sign checks the new signature with the signer's public
 // key, so the result is known to verify.
@@ -414,12 +435,15 @@ func Sign(body any, opts ProofOptions, signer Signer) (SignedDoc, error) {
 		return SignedDoc{}, errors.New("document already has a proof")
 	}
 
-	// Add the Data Integrity context, so the proof's terms are defined.
-	context, err := withDataIntegrityContext(document["@context"])
-	if err != nil {
-		return SignedDoc{}, fmt.Errorf("parsing document @context: %w", err)
+	// Make sure a JSON-LD document defines the proof's terms, and sign its
+	// @context as part of the proof. Plain JSON stays as it is.
+	if context, ok := document["@context"]; ok {
+		if context, err = withDataIntegrityContext(context); err != nil {
+			return SignedDoc{}, fmt.Errorf("parsing document @context: %w", err)
+		}
+		document["@context"] = context
+		proof.Context = context
 	}
-	document["@context"] = context
 
 	// Hash the body and the proof options, then sign.
 	unsignedBody, err := json.Marshal(document)
@@ -450,30 +474,37 @@ func Sign(body any, opts ProofOptions, signer Signer) (SignedDoc, error) {
 	return SignedDoc{Raw: signed, Body: unsignedBody, RawProofOptions: options, Proof: proof}, nil
 }
 
-// withDataIntegrityContext returns an @context value that includes
-// DataIntegrityContext. A context that already includes it is returned
-// unchanged. Otherwise it is appended, and a missing or null context becomes
-// an array of just that context. JSON-LD allows a context to be a single
-// value or an array.
+// withDataIntegrityContext returns an @context value that defines the Data
+// Integrity terms. A context that already includes DataIntegrityContext or
+// CredentialsV2Context is returned unchanged. Otherwise DataIntegrityContext
+// is appended, and a single context or null becomes an array. JSON-LD allows
+// a context to be a single value or an array.
 func withDataIntegrityContext(context json.RawMessage) (json.RawMessage, error) {
+	var value any
+	if err := json.Unmarshal(context, &value); err != nil {
+		return nil, err
+	}
 	var values []any
-	if len(context) > 0 {
-		var value any
-		if err := json.Unmarshal(context, &value); err != nil {
-			return nil, err
-		}
-		switch v := value.(type) {
-		case nil:
-		case []any:
-			values = v
-		default:
-			values = []any{v}
-		}
+	switch v := value.(type) {
+	case nil:
+	case []any:
+		values = v
+	default:
+		values = []any{v}
 	}
 	for _, v := range values {
-		if s, ok := v.(string); ok && s == DataIntegrityContext {
+		if v == DataIntegrityContext || v == CredentialsV2Context {
 			return context, nil
 		}
 	}
 	return json.Marshal(append(values, DataIntegrityContext))
+}
+
+// sameJSON reports whether a and b are the same JSON value, comparing their
+// JCS canonical forms. A value that cannot be canonicalized, including a
+// missing one, matches nothing.
+func sameJSON(a, b json.RawMessage) bool {
+	ca, errA := jcs.Transform(a)
+	cb, errB := jcs.Transform(b)
+	return errA == nil && errB == nil && bytes.Equal(ca, cb)
 }
