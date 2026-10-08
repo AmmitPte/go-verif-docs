@@ -2,6 +2,7 @@ package verifdocs
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -10,76 +11,104 @@ import (
 	"github.com/nuts-foundation/go-did/did"
 )
 
-// Encode the cryptosuite for a verifiable doc as an int,
-// makes it easier to handle in Go.
+// DataIntegrityContext is the JSON-LD context that defines Data Integrity
+// proofs. Sign adds it to the @context of every document it signs.
+const DataIntegrityContext = "https://w3id.org/security/data-integrity/v2"
+
+// The only proof type and purpose this package signs or accepts.
+const (
+	proofType    = "DataIntegrityProof"
+	proofPurpose = "assertionMethod"
+)
+
+// Errors returned by Verify and VerifyAt when a well-formed proof does not
+// verify. Use errors.Is to check for them.
+var (
+	// ErrInvalidSignature means the proof's signature is not valid for the
+	// document and key.
+	ErrInvalidSignature = errors.New("invalid signature")
+	// ErrProofNotYetValid and ErrProofExpired mean the verification time is
+	// outside the proof's validity period.
+	ErrProofNotYetValid = errors.New("proof is not yet valid")
+	ErrProofExpired     = errors.New("proof has expired")
+)
+
+// CryptoSuiteType identifies a Data Integrity cryptosuite. It marshals to and
+// from the suite's name, such as "ecdsa-jcs-2019".
 type CryptoSuiteType int
 
 const (
-	CryptoSuite_Unknown = iota
-	CryptoSuite_ECDSA_JCS_2019
-	CryptoSuite_ECDSA_RDFC_2019
-	CryptoSuite_EDDSA_JCS_2022
-	CryptoSuite_EDDSA_RDFC_2022
-	// TODO
+	CryptoSuiteUnknown CryptoSuiteType = iota
+	CryptoSuiteECDSAJCS2019
+	CryptoSuiteECDSARDFC2019
+	CryptoSuiteEDDSAJCS2022
+	CryptoSuiteEDDSARDFC2022
 )
 
+// String returns the suite's name, or "unknown crypto suite" for a value that
+// is not a known suite.
 func (cs CryptoSuiteType) String() string {
-	switch cs {
-	case CryptoSuite_ECDSA_JCS_2019:
-		return "ecdsa-jcs-2019"
-	case CryptoSuite_ECDSA_RDFC_2019:
-		return "ecdsa-rdfc-2019"
-	case CryptoSuite_EDDSA_JCS_2022:
-		return "eddsa-jcs-2022"
-	case CryptoSuite_EDDSA_RDFC_2022:
-		return "eddsa-rdfc-2022"
+	name, err := cs.MarshalText()
+	if err != nil {
+		return "unknown crypto suite"
 	}
-	return "Unknown crypto suite"
+	return string(name)
 }
 
+// MarshalText returns the suite's name. CryptoSuiteType is an int, so it can
+// hold values other than the declared constants. CryptoSuiteUnknown and any
+// such value are an error, so a proof never carries a name that UnmarshalText
+// would reject.
 func (cs CryptoSuiteType) MarshalText() ([]byte, error) {
-	return []byte(cs.String()), nil
-}
-
-func ParseCryptoSuite(str string) CryptoSuiteType {
-	switch str {
-	case "ecdsa-jcs-2019":
-		return CryptoSuite_ECDSA_JCS_2019
-	case "ecdsa-rdfc-2019":
-		return CryptoSuite_ECDSA_RDFC_2019
-	case "eddsa-jcs-2022":
-		return CryptoSuite_EDDSA_JCS_2022
-	case "eddsa-rdfc-2022":
-		return CryptoSuite_EDDSA_RDFC_2022
-	default:
-		return CryptoSuite_Unknown
+	switch cs {
+	case CryptoSuiteECDSAJCS2019:
+		return []byte("ecdsa-jcs-2019"), nil
+	case CryptoSuiteECDSARDFC2019:
+		return []byte("ecdsa-rdfc-2019"), nil
+	case CryptoSuiteEDDSAJCS2022:
+		return []byte("eddsa-jcs-2022"), nil
+	case CryptoSuiteEDDSARDFC2022:
+		return []byte("eddsa-rdfc-2022"), nil
 	}
+	return nil, fmt.Errorf("cannot marshal unknown crypto suite %d", int(cs))
 }
 
+// ParseCryptoSuite returns the suite with the given name, or
+// CryptoSuiteUnknown if the name is not recognised.
+func ParseCryptoSuite(name string) CryptoSuiteType {
+	for cs := CryptoSuiteECDSAJCS2019; cs <= CryptoSuiteEDDSARDFC2022; cs++ {
+		if cs.String() == name {
+			return cs
+		}
+	}
+	return CryptoSuiteUnknown
+}
+
+// UnmarshalText parses a suite name. An unrecognised name is an error.
 func (cs *CryptoSuiteType) UnmarshalText(text []byte) error {
 	parsed := ParseCryptoSuite(string(text))
-	if parsed == CryptoSuite_Unknown {
-		return fmt.Errorf("Unknown crypto suite: %q", string(text))
+	if parsed == CryptoSuiteUnknown {
+		return fmt.Errorf("unknown crypto suite %q", text)
 	}
 	*cs = parsed
 	return nil
 }
 
+// MatchesSigType reports whether the suite uses the given signature type.
+// An unknown suite matches none.
 func (cs CryptoSuiteType) MatchesSigType(sigType SigType) bool {
 	switch cs {
-	case CryptoSuite_ECDSA_JCS_2019, CryptoSuite_ECDSA_RDFC_2019:
-		return sigType == SigType_ECDSA
-	case CryptoSuite_EDDSA_JCS_2022, CryptoSuite_EDDSA_RDFC_2022:
-		return sigType == SigType_EDDSA
+	case CryptoSuiteECDSAJCS2019, CryptoSuiteECDSARDFC2019:
+		return sigType == SigTypeECDSA
+	case CryptoSuiteEDDSAJCS2022, CryptoSuiteEDDSARDFC2022:
+		return sigType == SigTypeEDDSA
 	}
 	return false
 }
 
-// Data integrity proof attached to verifiable docs.
-// If the ProofValue is omitted then it's just the config.
-// Unmarshals from JSON transparently.
-// NB: we don't check for a specific type or purpose here,
-// callers must check that this is correct for the app!
+// Proof is a Data Integrity proof. Without a ProofValue it is the proof
+// configuration that Sign completes. A proof never has its own @context; the
+// document's @context applies to it.
 type Proof struct {
 	ProofType          string          `json:"type"`
 	ProofPurpose       string          `json:"proofPurpose"`
@@ -90,71 +119,72 @@ type Proof struct {
 	Expires            time.Time       `json:"expires,omitzero"`
 }
 
-// A Verifiable Doc is just a body (without the proof), and a proof.
-// We keep the raw proof value in order to serialize it when checking
-// signatures, in case there are unsupported fields.
+// VerifiableDoc is a document body and the Data Integrity proof over it.
 type VerifiableDoc struct {
+	// Body is the document as JSON, without its proof.
 	Body  []byte
 	Proof Proof
-	// Always contains the proof section without the ProofValue
+	// rawProofOptions is the proof as JSON, without its proofValue. It is
+	// hashed as is, so proof fields this package does not model are still
+	// covered by the signature.
 	rawProofOptions []byte
 }
 
-// Unmarshal a byte array in JSON to a VerifiableDoc.
-// Parses only the top level JSON to extract the proof,
-// checks that the proof is well formed, but doesn't verify the sig.
-// Ends with the proof parsed, the body is the top level dictionary
-// (with the proof removed), and the raw proof JSON (needed for verifying
-// the signature later).
-// NB: enforces proof type to be DataIntegrityProof and purpose to be assertionMethod,
-// since that should always be the case for a verifiable doc.
+// ParseDoc parses a JSON document secured with a Data Integrity proof. It
+// checks that the document and its proof are well formed, but not the
+// signature or the proof's validity period. Use Verify for those.
+//
+// The proof must be a DataIntegrityProof for assertionMethod, and must not
+// have its own @context.
 func ParseDoc(data []byte) (VerifiableDoc, error) {
-	var document map[string]json.RawMessage
-	if err := json.Unmarshal(data, &document); err != nil {
-		return VerifiableDoc{}, fmt.Errorf("Error parsing doc: %w", err)
+	// encoding/json silently keeps the last of two duplicate keys, while other
+	// parsers may keep the first. JCS rejects duplicates at any depth, so a
+	// verified doc cannot be read two different ways.
+	if _, err := jcs.Transform(data); err != nil {
+		return VerifiableDoc{}, fmt.Errorf("parsing document: %w", err)
 	}
 
-	// Extract, verify, and remove the proof section
-	rawProof, exists := document["proof"]
-	if !exists {
-		return VerifiableDoc{}, fmt.Errorf("Doc has no proof section")
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(data, &document); err != nil {
+		return VerifiableDoc{}, fmt.Errorf("parsing document: %w", err)
 	}
+	rawProof, ok := document["proof"]
+	if !ok {
+		return VerifiableDoc{}, errors.New("document has no proof")
+	}
+	delete(document, "proof")
+
 	var proof Proof
 	if err := json.Unmarshal(rawProof, &proof); err != nil {
-		return VerifiableDoc{}, fmt.Errorf("Error parsing doc proof: %w", err)
+		return VerifiableDoc{}, fmt.Errorf("parsing proof: %w", err)
 	}
 	if err := checkProofConfig(proof); err != nil {
 		return VerifiableDoc{}, err
 	}
 	if len(proof.ProofValue) == 0 {
-		return VerifiableDoc{}, fmt.Errorf("Proof has no proofValue")
+		return VerifiableDoc{}, errors.New("proof has no proofValue")
 	}
-	delete(document, "proof")
 
-	bodyBytes, err := json.Marshal(document)
+	// The proof options are every proof field except proofValue, including
+	// fields that Proof does not model.
+	var proofOptions map[string]json.RawMessage
+	if err := json.Unmarshal(rawProof, &proofOptions); err != nil {
+		return VerifiableDoc{}, fmt.Errorf("parsing proof: %w", err)
+	}
+	if _, ok := proofOptions["@context"]; ok {
+		return VerifiableDoc{}, errors.New("proof must not have an @context")
+	}
+	delete(proofOptions, "proofValue")
+
+	body, err := json.Marshal(document)
 	if err != nil {
-		// Should be impossible, but just in case.
-		return VerifiableDoc{}, err
+		return VerifiableDoc{}, fmt.Errorf("encoding document: %w", err)
 	}
-
-	// Extract the proof in such a way that we can remove the proofValue
-	var proofMap map[string]json.RawMessage
-	if err := json.Unmarshal(rawProof, &proofMap); err != nil {
-		// This should be impossible if we parsed it previously, but just in case.
-		return VerifiableDoc{}, fmt.Errorf("Error parsing proof: %w", err)
-	}
-	delete(proofMap, "proofValue")
-	proofBytes, err := json.Marshal(proofMap)
+	options, err := json.Marshal(proofOptions)
 	if err != nil {
-		// Should be impossible, but just in case.
-		return VerifiableDoc{}, err
+		return VerifiableDoc{}, fmt.Errorf("encoding proof options: %w", err)
 	}
-
-	return VerifiableDoc{
-		Body:            bodyBytes,
-		Proof:           proof,
-		rawProofOptions: proofBytes,
-	}, nil
+	return VerifiableDoc{Body: body, Proof: proof, rawProofOptions: options}, nil
 }
 
 // checkProofConfig checks the proof fields that every proof must have before
@@ -162,156 +192,223 @@ func ParseDoc(data []byte) (VerifiableDoc, error) {
 // The cryptosuite can only be unknown here when the field is missing, because
 // unmarshalling rejects any suite name it does not recognise.
 func checkProofConfig(p Proof) error {
-	if p.ProofType != "DataIntegrityProof" {
-		return fmt.Errorf("Unsupported proof type: %s", p.ProofType)
+	if p.ProofType != proofType {
+		return fmt.Errorf("unsupported proof type %q", p.ProofType)
 	}
-	if p.ProofPurpose != "assertionMethod" {
-		return fmt.Errorf("Unsupported proof purpose: %s", p.ProofPurpose)
+	if p.ProofPurpose != proofPurpose {
+		return fmt.Errorf("unsupported proof purpose %q", p.ProofPurpose)
 	}
-	if p.CryptoSuite == CryptoSuite_Unknown {
-		return fmt.Errorf("Proof has no cryptosuite")
+	if p.CryptoSuite == CryptoSuiteUnknown {
+		return errors.New("proof has no cryptosuite")
 	}
 	if p.VerificationMethod == nil {
-		return fmt.Errorf("Proof has no verificationMethod")
+		return errors.New("proof has no verificationMethod")
+	}
+	if !p.Created.IsZero() && !p.Expires.IsZero() && !p.Expires.After(p.Created) {
+		return errors.New("proof expires at or before it was created")
 	}
 	return nil
 }
 
-// Get the hash of the doc appropriate for cryptosuite.
-func (vd VerifiableDoc) GetHash(hashfn func([]byte) []byte) ([]byte, error) {
+// checkValidAt checks that at falls within the proof's validity period. The
+// proof is valid from created, inclusive, until expires, exclusive. A missing
+// created or expires sets no bound.
+func (p Proof) checkValidAt(at time.Time) error {
+	if !p.Created.IsZero() && at.Before(p.Created) {
+		return fmt.Errorf("%w: created %s, checked at %s",
+			ErrProofNotYetValid, p.Created.Format(time.RFC3339), at.Format(time.RFC3339))
+	}
+	if !p.Expires.IsZero() && !at.Before(p.Expires) {
+		return fmt.Errorf("%w: expired %s, checked at %s",
+			ErrProofExpired, p.Expires.Format(time.RFC3339), at.Format(time.RFC3339))
+	}
+	return nil
+}
+
+// hashData returns the data that the doc's cryptosuite signs, using hash as
+// the suite's hash function. Only the JCS suites are supported.
+func (vd VerifiableDoc) hashData(hash func([]byte) []byte) ([]byte, error) {
 	switch vd.Proof.CryptoSuite {
-	case CryptoSuite_ECDSA_JCS_2019, CryptoSuite_EDDSA_JCS_2022:
-		// do nothing
+	case CryptoSuiteECDSAJCS2019, CryptoSuiteEDDSAJCS2022:
+		return jcsHashData(vd.Body, vd.rawProofOptions, hash)
 	default:
-		return []byte{}, fmt.Errorf("Unsupported hashing for cryptosuite %s", vd.Proof.CryptoSuite)
+		return nil, fmt.Errorf("unsupported cryptosuite %s", vd.Proof.CryptoSuite)
 	}
-	var dh DocHasher = JCSHasher(hashfn)
-	return dh.Hash(vd.Body, vd.rawProofOptions)
 }
 
-// Use a function pointer for the canonicalization method (JCS vs RDFC)
-// to make it generic for both.
-type DocHasher struct {
-	canonicalizer func([]byte) ([]byte, error)
-	hasher        func([]byte) []byte
-}
-
-// NB: Assumes that body has proof removed, and proofConfig has proofValue removed!!
-func (dh DocHasher) Hash(body []byte, proofConfig []byte) ([]byte, error) {
-	canonicalBody, err := dh.canonicalizer(body)
+// jcsHashData canonicalizes the proof options and the body with JCS
+// (RFC 8785), hashes each, and returns the proof options hash followed by the
+// body hash. body must not contain the proof, and proofOptions must not
+// contain the proofValue.
+func jcsHashData(body, proofOptions []byte, hash func([]byte) []byte) ([]byte, error) {
+	canonicalOptions, err := jcs.Transform(proofOptions)
 	if err != nil {
-		return []byte{}, err
+		return nil, fmt.Errorf("canonicalizing proof options: %w", err)
 	}
-	bodyHash := dh.hasher(canonicalBody)
-
-	canonicalProof, err := dh.canonicalizer(proofConfig)
+	canonicalBody, err := jcs.Transform(body)
 	if err != nil {
-		return []byte{}, err
+		return nil, fmt.Errorf("canonicalizing document: %w", err)
 	}
-	proofHash := dh.hasher(canonicalProof)
-
-	hashData := slices.Concat(proofHash[:], bodyHash[:])
-	return hashData, nil
+	return slices.Concat(hash(canonicalOptions), hash(canonicalBody)), nil
 }
 
-func JCSHasher(hashfn func([]byte) []byte) DocHasher {
-	return DocHasher{
-		canonicalizer: jcs.Transform,
-		hasher:        hashfn,
-	}
+// Verify checks the doc's proof as of the current time. See VerifyAt.
+func (vd VerifiableDoc) Verify(verifier SigVerifier) error {
+	return vd.VerifyAt(verifier, time.Now())
 }
 
-// Intentionally leave it to the caller to figure out the key for verification.
-func (vd VerifiableDoc) Verify(verifier SigVerifier) (bool, error) {
+// VerifyAt checks the doc's proof as of the time at. It returns nil only if
+// the signature is valid and at falls within the proof's created and expires
+// times.
+//
+// A signature that does not verify returns an error wrapping
+// ErrInvalidSignature. A proof that is not valid at that time returns an
+// error wrapping ErrProofNotYetValid or ErrProofExpired. Any other error
+// means the proof could not be checked, for example because the verifier's
+// key type does not match the cryptosuite.
+//
+// The caller is responsible for choosing the verifier, normally with
+// GetAssertionVerifier, and for checking that the key belongs to the
+// expected signer.
+func (vd VerifiableDoc) VerifyAt(verifier SigVerifier, at time.Time) error {
+	if verifier == nil {
+		return errors.New("no verifier given")
+	}
 	if !vd.Proof.CryptoSuite.MatchesSigType(verifier.sigType()) {
-		return false, fmt.Errorf("Verifier type %s does not match cryptosuite %s", verifier.sigType(), vd.Proof.CryptoSuite)
+		return fmt.Errorf("verifier type %s does not match cryptosuite %s", verifier.sigType(), vd.Proof.CryptoSuite)
 	}
-	dataHash, err := vd.GetHash(verifier.hash)
+	if err := vd.Proof.checkValidAt(at); err != nil {
+		return err
+	}
+	data, err := vd.hashData(verifier.hash)
 	if err != nil {
-		return false, fmt.Errorf("Error hashing doc: %w", err)
+		return fmt.Errorf("hashing document: %w", err)
 	}
-	return verifier.verify(dataHash, vd.Proof.ProofValue)
+	ok, err := verifier.verify(data, vd.Proof.ProofValue)
+	if err != nil {
+		// The signature is malformed, for example the wrong length.
+		return fmt.Errorf("%w: %w", ErrInvalidSignature, err)
+	}
+	if !ok {
+		return ErrInvalidSignature
+	}
+	return nil
 }
 
-// NB: we have no way to verify that DID URL given matches signer. Up to caller to ensure that!
+// MakeVerifiableDoc encodes doc as JSON and prepares an assertionMethod proof
+// for it, created now, ready for Sign. Nothing checks that vm names the key
+// that will sign it; that is up to the caller.
 func MakeVerifiableDoc(doc any, cs CryptoSuiteType, vm *did.DIDURL) (VerifiableDoc, error) {
-	// Make sure we can marshall to bytes.
-	bodyBytes, err := json.Marshal(doc)
+	body, err := json.Marshal(doc)
 	if err != nil {
 		return VerifiableDoc{}, err
 	}
-
-	proof := Proof{
-		ProofType:          "DataIntegrityProof",
-		ProofPurpose:       "assertionMethod",
-		CryptoSuite:        cs,
-		VerificationMethod: vm,
-		// UTC with whole seconds, the plainest form of an XML Schema dateTimeStamp.
-		Created: time.Now().UTC().Truncate(time.Second),
-	}
-
-	vd := VerifiableDoc{
-		Body:  bodyBytes,
-		Proof: proof,
-	}
-
-	return vd, nil
+	return VerifiableDoc{
+		Body: body,
+		Proof: Proof{
+			ProofType:          proofType,
+			ProofPurpose:       proofPurpose,
+			CryptoSuite:        cs,
+			VerificationMethod: vm,
+			// UTC with whole seconds, the plainest form of an XML Schema dateTimeStamp.
+			Created: time.Now().UTC().Truncate(time.Second),
+		},
+	}, nil
 }
 
+// Sign signs the doc and returns it as JSON with the proof embedded. It first
+// adds DataIntegrityContext to the document's @context, so Body changes too.
+// On success vd holds the new proof value and can be verified directly.
+// A doc that is already signed cannot be signed again.
 func (vd *VerifiableDoc) Sign(signer Signer) ([]byte, error) {
-	// Check that crypto suite and signer are compatible.
-	cs := vd.Proof.CryptoSuite
-	if !cs.MatchesSigType(signer.sigType()) {
-		return []byte{}, fmt.Errorf("Signer type %s does not match cryptosuite %s", signer.sigType(), cs)
+	// Re-encoding the map below would silently drop duplicate keys. JCS
+	// rejects them, as ParseDoc does, along with anything else it cannot
+	// canonicalize.
+	if _, err := jcs.Transform(vd.Body); err != nil {
+		return nil, fmt.Errorf("parsing document: %w", err)
+	}
+	if cs := vd.Proof.CryptoSuite; !cs.MatchesSigType(signer.sigType()) {
+		return nil, fmt.Errorf("signer type %s does not match cryptosuite %s", signer.sigType(), cs)
 	}
 	// Refuse to sign a proof that ParseDoc would reject.
 	if err := checkProofConfig(vd.Proof); err != nil {
-		return []byte{}, err
+		return nil, err
+	}
+	if len(vd.Proof.ProofValue) > 0 {
+		return nil, errors.New("document is already signed")
 	}
 
-	// Make sure we get rid of the proof value to overwrite it.
-	vd.Proof.ProofValue = nil
-
-	// Serialize the proof options so we can hash and then sign.
-	rawProofOptions, err := json.Marshal(vd.Proof)
-	if err != nil {
-		// Should be impossible, but just in case.
-		return []byte{}, err
-	}
-	vd.rawProofOptions = rawProofOptions
-
-	dataHash, err := vd.GetHash(signer.hash)
-	if err != nil {
-		return []byte{}, fmt.Errorf("Error hashing doc: %w", err)
-	}
-
-	sig, err := signer.sign(dataHash)
-	if err != nil {
-		return []byte{}, fmt.Errorf("Error signing doc: %w", err)
-	}
-	vd.Proof.ProofValue = sig
-
-	// Assemble the doc by embedding the proof inside of it.
-	var docMap map[string]json.RawMessage
-	if err := json.Unmarshal(vd.Body, &docMap); err != nil {
-		return []byte{}, fmt.Errorf("Error parsing base doc: %w", err)
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(vd.Body, &document); err != nil {
+		return nil, fmt.Errorf("parsing document: %w", err)
 	}
 	// JSON null unmarshals without error and leaves the map nil.
-	if docMap == nil {
-		return []byte{}, fmt.Errorf("Error parsing base doc: document is null")
+	if document == nil {
+		return nil, errors.New("document is null")
 	}
-	rawProof, err := json.Marshal(vd.Proof)
-	if err != nil {
-		// Should be impossible, but just in case.
-		return []byte{}, err
-	}
-	docMap["proof"] = rawProof
-
-	bytes, err := json.Marshal(docMap)
-	if err != nil {
-		// Should be impossible, but just in case.
-		return []byte{}, err
+	// The old proof would be hashed as part of the body and then replaced,
+	// giving a doc that can never verify. Proof sets are not supported.
+	if _, ok := document["proof"]; ok {
+		return nil, errors.New("document already has a proof")
 	}
 
-	return bytes, nil
+	// Add the Data Integrity context, so the proof's terms are defined.
+	context, err := withDataIntegrityContext(document["@context"])
+	if err != nil {
+		return nil, fmt.Errorf("parsing document @context: %w", err)
+	}
+	document["@context"] = context
+	if vd.Body, err = json.Marshal(document); err != nil {
+		return nil, fmt.Errorf("encoding document: %w", err)
+	}
+
+	// Hash the body and the proof options, then sign.
+	if vd.rawProofOptions, err = json.Marshal(vd.Proof); err != nil {
+		return nil, fmt.Errorf("encoding proof options: %w", err)
+	}
+	data, err := vd.hashData(signer.hash)
+	if err != nil {
+		return nil, fmt.Errorf("hashing document: %w", err)
+	}
+	if vd.Proof.ProofValue, err = signer.sign(data); err != nil {
+		return nil, fmt.Errorf("signing document: %w", err)
+	}
+
+	// Assemble the signed doc by embedding the proof in it.
+	if document["proof"], err = json.Marshal(vd.Proof); err != nil {
+		return nil, fmt.Errorf("encoding proof: %w", err)
+	}
+	signed, err := json.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("encoding signed document: %w", err)
+	}
+	return signed, nil
+}
+
+// withDataIntegrityContext returns an @context value that includes
+// DataIntegrityContext. A context that already includes it is returned
+// unchanged. Otherwise it is appended, and a missing or null context becomes
+// an array of just that context. JSON-LD allows a context to be a single
+// value or an array.
+func withDataIntegrityContext(context json.RawMessage) (json.RawMessage, error) {
+	var values []any
+	if len(context) > 0 {
+		var value any
+		if err := json.Unmarshal(context, &value); err != nil {
+			return nil, err
+		}
+		switch v := value.(type) {
+		case nil:
+		case []any:
+			values = v
+		default:
+			values = []any{v}
+		}
+	}
+	for _, v := range values {
+		if s, ok := v.(string); ok && s == DataIntegrityContext {
+			return context, nil
+		}
+	}
+	return json.Marshal(append(values, DataIntegrityContext))
 }

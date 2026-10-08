@@ -2,16 +2,14 @@ package verifdocs
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
-	"crypto/sha512"
 	"encoding/binary"
-	"encoding/hex"
-	"encoding/json"
 	"math/big"
+	"os"
 	"strings"
 	"testing"
 
@@ -20,284 +18,187 @@ import (
 	"github.com/nuts-foundation/go-did/did"
 )
 
-// ecdsaJCSVectors are known-answer tests for multikey verification.
-//
-// P-256 and P-384 are the ecdsa-jcs-2019 vectors from
-// https://w3c.github.io/vc-di-ecdsa/#representation-ecdsa-jcs-2019-with-curve-p-256
-// and the matching P-384 section. digest is proofHash || credentialHash.
-// sig is the raw IEEE P1363 signature (r || s).
-//
-// That specification does not publish a P-521 vector. The P-521 entry is a
-// fixed signature over SHA-512 of the digest.
-type multikeyVector struct {
-	name   string
-	key    string
-	digest string
-	sig    string
+// --- Multikey verifiers ---
+
+// keyVector is a Multikey public key and a known signature made with it.
+type keyVector struct {
+	name    string
+	key     string // Multikey
+	sigType SigType
+	data    string // hex; the data that was signed
+	sig     string // hex
 }
 
-var ecdsaJCSVectors = []multikeyVector{
+// parse returns a verifier for the key, and the decoded data and signature.
+func (v keyVector) parse(t *testing.T) (SigVerifier, []byte, []byte) {
+	t.Helper()
+	return mustVerifier(t, v.key), mustDecodeHex(t, v.data), mustDecodeHex(t, v.sig)
+}
+
+// multikeyVectors has a known signature for each supported key type. The
+// P-256, P-384 and Ed25519 entries are the W3C vectors' keys and signatures,
+// where the signed data is the credential's hash data. No published vector
+// uses P-521, so that entry signs the ASCII bytes "p521-document-digest".
+var multikeyVectors = []keyVector{
+	{name: "P-256", key: vectorP256.publicKey, sigType: SigTypeECDSA, data: vectorP256.hashData, sig: vectorP256.signature},
+	{name: "P-384", key: vectorP384.publicKey, sigType: SigTypeECDSA, data: vectorP384.hashData, sig: vectorP384.signature},
 	{
-		name: "P-256",
-		key:  "zDnaepBuvsQ8cpsWrVKw8fbpGpvPeNSjVPTWoq6cRqaYzBKVP",
-		digest: "fe5799489119c7fe3c528715e72bd39d2ec6b4ab345978df32e9a9312648ec25" +
-			"59b7cb6251b8991add1ce0bc83107e3db9dbbab5bd2c28f687db1a03abc92f19",
-		sig: "f15c3b599eb9b3cad05df9d8e8b39a70a86375833b53743c764ac0a88c4457d6" +
-			"0707fd7d073e03d906130631d87803f80a9824dc9939632ba92d418181be9d16",
-	},
-	{
-		name: "P-384",
-		key:  "z82LkuBieyGShVBhvtE2zoiD6Kma4tJGFtkAhxR5pfkp5QPw4LutoYWhvQCnGjdVn14kujQ",
-		digest: "83e5057817abb0c6872eafeaba1a9e53893c58eeb7414fb6d8aa3fa8c7917f7a" +
-			"d4792890b257c598baa17f4fbe6d183c" +
-			"3e0be671cc1881035d463158c80921973dab3534d4f8dfacf4ff2725a4115eb7" +
-			"18e49d66de0e90e7365cd6062abf2259",
-		sig: "8b7462ce62db0c8ff19878c4b3561c49eb71b4a743086b6d5b0eda70ecf0afc5" +
-			"a03fd88eb207d66b262ed87fd200a4e8e62716e0b329c032b67726b4b0fc737a" +
-			"44c1cefdba2fdccb3ece74cc5845aaa93374455a726f6ee4f5f30da9427f608a",
-	},
-	{
-		name:   "P-521",
-		key:    "z2J9gcGqxxSkswmHnEcRBSPvjjquhNTtUbqxv87Mqp7dhaiW4cxuSdb7awhebt7UeeqNoLGA45o72ksBo3FwdGtPaFp89aLn",
-		digest: "703532312d646f63756d656e742d646967657374",
+		name:    "P-521",
+		key:     "z2J9gcGqxxSkswmHnEcRBSPvjjquhNTtUbqxv87Mqp7dhaiW4cxuSdb7awhebt7UeeqNoLGA45o72ksBo3FwdGtPaFp89aLn",
+		sigType: SigTypeECDSA,
+		data:    "703532312d646f63756d656e742d646967657374",
 		sig: "019c1356656ff259305600d28bd4580aa97e30ea5f45c83bc492f02414d82d07" +
 			"183bb9f38f6fb929701b69902e8c79471b531f6e7a6319b35e4f945df62f601d" +
 			"29a2015d4c11ffeb93f87aa3a6eb19c583d6dabfeb3709fca7c7901736d9c4d5" +
 			"ef530c7d858858eb0afb99c3593601ee7af15eebb5d8a1a84013f47c9a81c1b3" +
 			"de73bd20",
 	},
+	{name: "Ed25519", key: vectorEd25519.publicKey, sigType: SigTypeEDDSA, data: vectorEd25519.hashData, sig: vectorEd25519.signature},
 }
 
 // codecX25519 is the x25519-pub multicodec, a key-agreement key this package
 // does not support. The supported codecs are defined in keys.go.
 const codecX25519 = 0xec
 
-// eddsa-jcs-2022 vector from Appendix B.3 of
-// https://w3c.github.io/vc-di-eddsa/#representation-eddsa-jcs-2022
-// digest is SHA-256(canonical proof) || SHA-256(canonical document).
-// sig is the raw 64-byte Ed25519 signature over that concatenation.
-const (
-	ed25519PublicKey = "z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2"
-	ed25519Digest    = "66ab154f5c2890a140cb8388a22a160454f80575f6eae09e5a097cabe539a1db" +
-		"59b7cb6251b8991add1ce0bc83107e3db9dbbab5bd2c28f687db1a03abc92f19"
-	ed25519Sig = "407cd12654b33d718ecbb99179a1506daaa849450bf3fc523cce3e1c96f8b803" +
-		"51da3f253d725c6f00b07c9e5448d50b3ef78012b9ab54255116d069c6dd2808"
-)
-
-func TestVerifierFromMultikey_VerifiesKnownDigest(t *testing.T) {
-	for _, vec := range ecdsaJCSVectors {
-		t.Run(vec.name, func(t *testing.T) {
-			t.Parallel()
-			verifier, digest, sig := parseMultikeyVector(t, vec.key, vec.digest, vec.sig)
-
-			ok, err := verifier.verify(digest, sig)
-			if err != nil {
-				t.Fatalf("verify: %v", err)
-			}
-			if !ok {
-				t.Fatal("verify returned false for the known digest")
-			}
-		})
-	}
-}
-
-func TestVerifierFromMultikey_RejectsDifferentDigestOrSignature(t *testing.T) {
-	for _, vec := range ecdsaJCSVectors {
-		t.Run(vec.name, func(t *testing.T) {
-			t.Parallel()
-			verifier, digest, sig := parseMultikeyVector(t, vec.key, vec.digest, vec.sig)
-
-			t.Run("digest", func(t *testing.T) {
-				tampered := bytes.Clone(digest)
-				tampered[0] ^= 0x01
-				assertVerifyRejected(t, verifier, tampered, sig)
-			})
-			t.Run("signature", func(t *testing.T) {
-				tampered := bytes.Clone(sig)
-				tampered[len(tampered)-1] ^= 0x01
-				assertVerifyRejected(t, verifier, digest, tampered)
-			})
-		})
-	}
-}
-
-func TestVerifierFromMultikey_Ed25519VerifiesKnownDigest(t *testing.T) {
-	verifier, digest, sig := parseEd25519Vector(t)
-	if verifier.sigType() != SigType_EDDSA {
-		t.Fatalf("sigType = %v, want EdDSA", verifier.sigType())
-	}
-
-	ok, err := verifier.verify(digest, sig)
+func encodeMultikey(t *testing.T, codec uint64, key []byte) string {
+	t.Helper()
+	encoded, err := multibase.Encode(multibase.Base58BTC, append(binary.AppendUvarint(nil, codec), key...))
 	if err != nil {
-		t.Fatalf("verify: %v", err)
+		t.Fatalf("multibase.Encode: %v", err)
 	}
-	if !ok {
-		t.Fatal("verify returned false for the known digest")
+	return encoded
+}
+
+// requireNoVerifier checks that making a verifier failed with an error
+// containing want. The verifier must be a nil interface: a nil pointer inside
+// a non-nil interface would pass a caller's nil check.
+func requireNoVerifier(t *testing.T, verifier SigVerifier, err error, want string) {
+	t.Helper()
+	requireErrorContains(t, err, want)
+	if verifier != nil {
+		t.Errorf("verifier = %#v, want a nil interface", verifier)
+	}
+}
+
+func TestVerifierFromMultikey_KnownSignatures(t *testing.T) {
+	for _, vec := range multikeyVectors {
+		t.Run(vec.name, func(t *testing.T) {
+			t.Parallel()
+			verifier, data, sig := vec.parse(t)
+			if got := verifier.sigType(); got != vec.sigType {
+				t.Errorf("sigType = %v, want %v", got, vec.sigType)
+			}
+			requireSigVerifies(t, verifier, data, sig)
+			requireSigRejected(t, verifier, flipBit(data, 0), sig)
+			requireSigRejected(t, verifier, data, flipBit(sig, len(sig)-1))
+		})
+	}
+}
+
+func TestVerifier_WrongSignatureLength(t *testing.T) {
+	for _, vec := range multikeyVectors {
+		t.Run(vec.name, func(t *testing.T) {
+			t.Parallel()
+			verifier, data, sig := vec.parse(t)
+			for _, bad := range [][]byte{nil, sig[:len(sig)-1], append(bytes.Clone(sig), 0x00)} {
+				ok, err := verifier.verify(data, bad)
+				if ok {
+					t.Fatalf("verify accepted a %d-byte signature", len(bad))
+				}
+				requireErrorContains(t, err, "wrong signature size")
+			}
+		})
 	}
 }
 
 func TestEDDSAVerifier_HashIsSHA256(t *testing.T) {
-	verifier, _, _ := parseEd25519Vector(t)
 	msg := []byte("canonical-bytes")
-	sum := sha256.Sum256(msg)
-	if !bytes.Equal(verifier.hash(msg), sum[:]) {
-		t.Fatalf("hash = %x, want SHA-256 %x", verifier.hash(msg), sum[:])
+	h := crypto.SHA256.New()
+	h.Write(msg)
+	if got, want := mustVerifier(t, vectorEd25519.publicKey).hash(msg), h.Sum(nil); !bytes.Equal(got, want) {
+		t.Errorf("hash = %x, want SHA-256 %x", got, want)
 	}
 }
 
-func TestVerifierFromMultikey_Ed25519RejectsDifferentDigestOrSignature(t *testing.T) {
-	verifier, digest, sig := parseEd25519Vector(t)
-
-	t.Run("digest", func(t *testing.T) {
-		tampered := bytes.Clone(digest)
-		tampered[0] ^= 0x01
-		assertVerifyRejected(t, verifier, tampered, sig)
-	})
-	t.Run("signature", func(t *testing.T) {
-		tampered := bytes.Clone(sig)
-		tampered[len(tampered)-1] ^= 0x01
-		assertVerifyRejected(t, verifier, digest, tampered)
-	})
-	t.Run("noncanonical signature", func(t *testing.T) {
-		// RFC 8032 rejects signatures whose final byte has the top bits set.
-		tampered := bytes.Clone(sig)
-		tampered[63] |= 0x80
-		assertVerifyRejected(t, verifier, digest, tampered)
-	})
+// RFC 8032 rejects a signature whose final byte has its top bit set.
+func TestEDDSAVerifier_RejectsNonCanonicalSignature(t *testing.T) {
+	verifier := mustVerifier(t, vectorEd25519.publicKey)
+	data, sig := mustDecodeHex(t, vectorEd25519.hashData), mustDecodeHex(t, vectorEd25519.signature)
+	sig[ed25519.SignatureSize-1] |= 0x80
+	requireSigRejected(t, verifier, data, sig)
 }
 
-func TestEDDSAVerifier_WrongSignatureLength(t *testing.T) {
-	verifier, digest, sig := parseEd25519Vector(t)
-	cases := []struct {
+func TestEDDSAVerifier_RejectsOtherKeys(t *testing.T) {
+	data, sig := mustDecodeHex(t, vectorEd25519.hashData), mustDecodeHex(t, vectorEd25519.signature)
+	otherKey, _, err := ed25519.GenerateKey(bytes.NewReader(bytes.Repeat([]byte{0x07}, ed25519.SeedSize)))
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	tests := []struct {
 		name string
-		sig  []byte
+		key  []byte
 	}{
-		{name: "empty", sig: nil},
-		{name: "short", sig: sig[:ed25519.SignatureSize-1]},
-		{name: "long", sig: append(bytes.Clone(sig), 0x00)},
+		{name: "different key", key: otherKey},
+		// Parsing accepts any 32 bytes. These are not a canonical
+		// edwards25519 point, so verification rejects them.
+		{name: "off curve", key: bytes.Repeat([]byte{0xff}, ed25519.PublicKeySize)},
 	}
-	for _, tt := range cases {
+	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ok, err := verifier.verify(digest, tt.sig)
-			if ok {
-				t.Fatal("verify returned true")
-			}
-			if err == nil {
-				t.Fatal("expected a signature size error")
-			}
-			if !strings.Contains(err.Error(), "wrong signature size") {
-				t.Fatalf("error = %q, want a signature size error", err)
-			}
+			t.Parallel()
+			verifier := mustVerifier(t, encodeMultikey(t, codecEd25519, tt.key))
+			requireSigRejected(t, verifier, data, sig)
 		})
 	}
 }
 
-func TestVerifierFromMultikey_Ed25519RejectsOtherKeys(t *testing.T) {
-	_, digest, sig := parseEd25519Vector(t)
-
-	t.Run("different key", func(t *testing.T) {
-		pub, _, err := ed25519.GenerateKey(bytes.NewReader(bytes.Repeat([]byte{0x07}, ed25519.SeedSize)))
-		if err != nil {
-			t.Fatalf("GenerateKey: %v", err)
-		}
-		verifier, err := VerifierFromMultikey(encodeMultikey(t, codecEd25519, pub))
-		if err != nil {
-			t.Fatalf("VerifierFromMultikey: %v", err)
-		}
-		assertVerifyRejected(t, verifier, digest, sig)
-	})
-	t.Run("off curve", func(t *testing.T) {
-		// 32 0xff bytes is not a canonical edwards25519 point.
-		// Parsing accepts any 32-byte key; verification rejects it.
-		verifier, err := VerifierFromMultikey(encodeMultikey(t, codecEd25519, bytes.Repeat([]byte{0xff}, ed25519.PublicKeySize)))
-		if err != nil {
-			t.Fatalf("VerifierFromMultikey: %v", err)
-		}
-		assertVerifyRejected(t, verifier, digest, sig)
-	})
-}
-
-func TestVerifierFromMultikey_UnknownCodec(t *testing.T) {
-	// x25519-pub is a key-agreement codec, not a signature key.
-	key := encodeMultikey(t, codecX25519, bytes.Repeat([]byte{0x11}, 32))
-	_, err := VerifierFromMultikey(key)
-	if err == nil {
-		t.Fatal("expected an error for an unknown multicodec")
-	}
-	if !strings.Contains(err.Error(), "unsupported multicodec") {
-		t.Fatalf("error = %q, want an unsupported multicodec error", err)
-	}
+func TestVerifierFromMultikey_UnsupportedCodec(t *testing.T) {
+	verifier, err := VerifierFromMultikey(encodeMultikey(t, codecX25519, bytes.Repeat([]byte{0x11}, 32)))
+	requireNoVerifier(t, verifier, err, "unsupported multicodec 0xec")
 }
 
 func TestVerifierFromMultikey_WrongKeyLength(t *testing.T) {
-	curves := []struct {
+	tests := []struct {
 		name    string
 		codec   uint64
 		keySize int
 	}{
-		{"P-256", codecP256, 33},
-		{"P-384", codecP384, 49},
-		{"P-521", codecP521, 67},
-		{"Ed25519", codecEd25519, ed25519.PublicKeySize},
+		{name: "P-256", codec: codecP256, keySize: 33},
+		{name: "P-384", codec: codecP384, keySize: 49},
+		{name: "P-521", codec: codecP521, keySize: 67},
+		{name: "Ed25519", codec: codecEd25519, keySize: ed25519.PublicKeySize},
 	}
-	for _, curve := range curves {
-		t.Run(curve.name, func(t *testing.T) {
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			for _, delta := range []int{-1, 1} {
-				name := "short"
-				if delta > 0 {
-					name = "long"
-				}
-				t.Run(name, func(t *testing.T) {
-					keyBytes := bytes.Repeat([]byte{0x02}, curve.keySize+delta)
-					key := encodeMultikey(t, curve.codec, keyBytes)
-					verifier, err := VerifierFromMultikey(key)
-					if err == nil {
-						t.Fatal("expected an error for the wrong key length")
-					}
-					// A nil pointer inside a non-nil interface would pass a nil check by the caller.
-					if verifier != nil {
-						t.Errorf("verifier = %#v, want nil interface with error", verifier)
-					}
-					if !strings.Contains(err.Error(), "public key length") {
-						t.Fatalf("error = %q, want a public key length error", err)
-					}
-				})
+			for _, size := range []int{tt.keySize - 1, tt.keySize + 1} {
+				key := encodeMultikey(t, tt.codec, bytes.Repeat([]byte{0x02}, size))
+				verifier, err := VerifierFromMultikey(key)
+				requireNoVerifier(t, verifier, err, "public key length")
 			}
 		})
 	}
 }
 
 func TestVerifierFromMultikey_InvalidCurvePoint(t *testing.T) {
-	// x = 7 is inside the field prime of each curve and has no corresponding y.
-	curves := []struct {
-		name           string
-		codec          uint64
-		compressedSize int
+	tests := []struct {
+		name  string
+		codec uint64
+		size  int
 	}{
-		{"P-256", codecP256, 33},
-		{"P-384", codecP384, 49},
-		{"P-521", codecP521, 67},
+		{name: "P-256", codec: codecP256, size: 33},
+		{name: "P-384", codec: codecP384, size: 49},
+		{name: "P-521", codec: codecP521, size: 67},
 	}
-	for _, curve := range curves {
-		t.Run(curve.name, func(t *testing.T) {
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			point := make([]byte, curve.compressedSize)
+			// x = 7 is inside each curve's field and has no matching y.
+			point := make([]byte, tt.size)
 			point[0] = 0x02
 			point[len(point)-1] = 0x07
-
-			key := encodeMultikey(t, curve.codec, point)
-			verifier, err := VerifierFromMultikey(key)
-			if err == nil {
-				t.Fatal("expected an error for an invalid curve point")
-			}
-			// A nil pointer inside a non-nil interface would pass a nil check by the caller.
-			if verifier != nil {
-				t.Errorf("verifier = %#v, want nil interface with error", verifier)
-			}
-			if !strings.Contains(err.Error(), "curve point") {
-				t.Fatalf("error = %q, want a curve point error", err)
-			}
+			verifier, err := VerifierFromMultikey(encodeMultikey(t, tt.codec, point))
+			requireNoVerifier(t, verifier, err, "curve point")
 		})
 	}
 }
@@ -316,233 +217,121 @@ func TestVerifierFromMultikey_InvalidPrefix(t *testing.T) {
 			t.Parallel()
 			key, err := multibase.Encode(multibase.Base58BTC, tt.decoded)
 			if err != nil {
-				t.Fatalf("multibase encode: %v", err)
+				t.Fatalf("multibase.Encode: %v", err)
 			}
 			verifier, err := VerifierFromMultikey(key)
-			if err == nil {
-				t.Fatalf("VerifierFromMultikey succeeded with %T", verifier)
-			}
-			if verifier != nil {
-				t.Errorf("verifier = %#v, want nil interface with error", verifier)
-			}
-			if !strings.Contains(err.Error(), "invalid multicodec prefix") {
-				t.Fatalf("error = %q, want an invalid multicodec prefix error", err)
-			}
+			requireNoVerifier(t, verifier, err, "invalid multicodec prefix")
 		})
 	}
 }
 
 func TestVerifierFromMultikey_InvalidEncoding(t *testing.T) {
-	_, err := VerifierFromMultikey("not-a-multikey")
-	if err == nil {
-		t.Fatal("expected an error for an invalid multikey")
-	}
+	verifier, err := VerifierFromMultikey("not-a-multikey")
+	requireNoVerifier(t, verifier, err, "decoding multikey")
 }
+
+// --- ECDSA signer ---
 
 func TestECDSASigner_SignsWithAllCurves(t *testing.T) {
 	msg := []byte("canonical-bytes")
-	curves := []struct {
-		name   string
+	tests := []struct {
 		curve  elliptic.Curve
+		hash   crypto.Hash
 		sigLen int
-		hash   func([]byte) []byte
 	}{
-		{
-			name:   "P-256",
-			curve:  elliptic.P256(),
-			sigLen: 64,
-			hash: func(data []byte) []byte {
-				sum := sha256.Sum256(data)
-				return sum[:]
-			},
-		},
-		{
-			name:   "P-384",
-			curve:  elliptic.P384(),
-			sigLen: 96,
-			hash: func(data []byte) []byte {
-				sum := sha512.Sum384(data)
-				return sum[:]
-			},
-		},
-		{
-			name:   "P-521",
-			curve:  elliptic.P521(),
-			sigLen: 132,
-			hash: func(data []byte) []byte {
-				sum := sha512.Sum512(data)
-				return sum[:]
-			},
-		},
+		{curve: elliptic.P256(), hash: crypto.SHA256, sigLen: 64},
+		{curve: elliptic.P384(), hash: crypto.SHA384, sigLen: 96},
+		{curve: elliptic.P521(), hash: crypto.SHA512, sigLen: 132},
 	}
-	for _, curve := range curves {
-		t.Run(curve.name, func(t *testing.T) {
+	for _, tt := range tests {
+		t.Run(tt.curve.Params().Name, func(t *testing.T) {
 			t.Parallel()
-			signer, err := GenerateECDSASigner(curve.curve)
+			signer, err := GenerateECDSASigner(tt.curve)
 			if err != nil {
 				t.Fatalf("GenerateECDSASigner: %v", err)
 			}
-			if signer.sigType() != SigType_ECDSA {
-				t.Fatalf("sigType = %v, want ECDSA", signer.sigType())
+			if got := signer.sigType(); got != SigTypeECDSA {
+				t.Errorf("sigType = %v, want %v", got, SigTypeECDSA)
 			}
 
-			digest := curve.hash(msg)
-			if !bytes.Equal(signer.hash(msg), digest) {
-				t.Fatalf("hash = %x, want %x", signer.hash(msg), digest)
+			h := tt.hash.New()
+			h.Write(msg)
+			if got, want := signer.hash(msg), h.Sum(nil); !bytes.Equal(got, want) {
+				t.Errorf("hash = %x, want %v %x", got, tt.hash, want)
 			}
 
 			sig, err := signer.sign(msg)
 			if err != nil {
 				t.Fatalf("sign: %v", err)
 			}
-			if len(sig) != curve.sigLen {
-				t.Fatalf("signature length = %d, want %d", len(sig), curve.sigLen)
+			if len(sig) != tt.sigLen {
+				t.Fatalf("signature length = %d, want %d", len(sig), tt.sigLen)
 			}
-
-			keySize := curve.sigLen / 2
-			r := new(big.Int).SetBytes(sig[:keySize])
-			s := new(big.Int).SetBytes(sig[keySize:])
-			if !ecdsa.Verify(&signer.signKey.PublicKey, digest, r, s) {
-				t.Fatal("signature did not verify")
-			}
-
-			// Check that the verifier interface works too.
-			b, err := signer.verifier().verify(msg, sig)
-			if err != nil {
-				t.Fatalf("Error verifying sig: %s", err)
-			}
-			if !b {
-				t.Fatal("Verifier failed to verify sig")
-			}
-
-			tampered := bytes.Clone(msg)
-			tampered[0] ^= 0x01
-			if ecdsa.Verify(&signer.signKey.PublicKey, curve.hash(tampered), r, s) {
-				t.Fatal("signature verified a different message")
-			}
-
-			b, err = signer.verifier().verify(tampered, sig)
-			if err != nil {
-				t.Fatalf("Error verifying tampered sig: %s", err)
-			}
-			if b {
-				t.Fatal("Verifier verified a different message")
-			}
+			requireSigVerifies(t, signer.verifier(), msg, sig)
+			requireSigRejected(t, signer.verifier(), flipBit(msg, 0), sig)
 		})
 	}
 }
 
+// crypto/ecdsa refuses to sign with a scalar outside 1 to N-1.
 func TestECDSASigner_InvalidSigningKey(t *testing.T) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
-
-	// crypto/ecdsa rejects a scalar that is outside 1..N-1.
-	orderBits := uint(priv.Params().N.BitLen())
-	cases := []struct {
+	tests := []struct {
 		name string
 		d    *big.Int
 	}{
 		{name: "zero", d: big.NewInt(0)},
 		{name: "negative", d: big.NewInt(-1)},
-		{name: "too large", d: new(big.Int).Lsh(big.NewInt(1), orderBits)},
+		{name: "too large", d: new(big.Int).Lsh(big.NewInt(1), uint(key.Params().N.BitLen()))},
 	}
-	for _, tt := range cases {
+	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			key := *priv
-			key.D = tt.d
-			signer := ECDSASigner{signKey: key}
-
+			signer := ECDSASigner{signKey: *key}
+			signer.signKey.D = tt.d
 			sig, err := signer.sign([]byte("canonical-bytes"))
-			if err == nil {
-				t.Fatal("expected an error for an invalid signing key")
-			}
-			if len(sig) != 0 {
-				t.Fatalf("signature = %x, want none", sig)
-			}
-			if !strings.Contains(err.Error(), "Error signing") || !strings.Contains(err.Error(), "private key scalar") {
-				t.Fatalf("error = %q, want a signing error for an invalid scalar", err)
+			requireErrorContains(t, err, "private key scalar")
+			if sig != nil {
+				t.Errorf("signature = %x, want none", sig)
 			}
 		})
 	}
 }
 
-func parseEd25519Vector(t *testing.T) (SigVerifier, []byte, []byte) {
-	t.Helper()
-	return parseMultikeyVector(t, ed25519PublicKey, ed25519Digest, ed25519Sig)
-}
+// --- JWK verifiers ---
 
-func parseMultikeyVector(t *testing.T, key, digestHex, sigHex string) (SigVerifier, []byte, []byte) {
-	t.Helper()
-	verifier, err := VerifierFromMultikey(key)
-	if err != nil {
-		t.Fatalf("VerifierFromMultikey: %v", err)
-	}
-	return verifier, mustDecodeHex(t, digestHex), mustDecodeHex(t, sigHex)
-}
-
-func assertVerifyRejected(t *testing.T, verifier SigVerifier, digest, sig []byte) {
-	t.Helper()
-	ok, err := verifier.verify(digest, sig)
-	if err != nil {
-		t.Fatalf("verify: %v", err)
-	}
-	if ok {
-		t.Fatal("verify returned true")
-	}
-}
-
-func encodeMultikey(t *testing.T, codec uint64, key []byte) string {
-	t.Helper()
-	prefix := make([]byte, binary.MaxVarintLen64)
-	n := binary.PutUvarint(prefix, codec)
-	encoded, err := multibase.Encode(multibase.Base58BTC, append(prefix[:n], key...))
-	if err != nil {
-		t.Fatalf("multibase encode: %v", err)
-	}
-	return encoded
-}
-
-func mustDecodeHex(t *testing.T, s string) []byte {
-	t.Helper()
-	decoded, err := hex.DecodeString(s)
-	if err != nil {
-		t.Fatalf("decode hex: %v", err)
-	}
-	return decoded
-}
-
-// jwkVectors are fixed public JWKs with a signature over msg made by the
-// matching private key. ECDSA signatures are r || s over the curve's paired
+// jwkVector is a public JWK and a signature over msg made with the matching
+// private key. ECDSA signatures are r followed by s, over the curve's paired
 // hash of msg. The Ed25519 signature is PureEdDSA over msg.
 type jwkVector struct {
 	name    string
 	jwk     string
 	msg     string
-	sig     string
+	sig     string // hex
 	sigType SigType
 }
 
-var jwkVectors = []jwkVector{
-	{
+var (
+	jwkP256 = jwkVector{
 		name: "P-256",
 		jwk:  `{"kty":"EC","crv":"P-256","x":"LBNH18YEH_p6qrdchyhAwcMxxILF0JleBHhAXC_q20Y","y":"aE21SsBS2M5tQJj1yDjUWocqcmwMcvBK7MvhAfTHOMk"}`,
 		msg:  "jwk test message for P-256",
 		sig: "f43dbcaee509e2095b20b25f01682d02ae0f0605dd91d42594468fc9cf34e813" +
 			"31460f5e9101bc18fdb6dd7a3394e705b793961783ee73d7889d64e0f8f351e5",
-		sigType: SigType_ECDSA,
-	},
-	{
+		sigType: SigTypeECDSA,
+	}
+	jwkP384 = jwkVector{
 		name: "P-384",
 		jwk:  `{"kty":"EC","crv":"P-384","x":"grf8ZHrRDswRg9J7ZcqLmjR6DsI4FZ6NdwkUQ20wGAyhvFdlFM7VfZ_O0IaGN2uQ","y":"SPNKkIzF7QMW_4e9xRwE_Vl3FE8EhxnYJqQagdsqjBepga-HfE0WBHQ_Dl5jtTev"}`,
 		msg:  "jwk test message for P-384",
 		sig: "437920ce2bb6da476154e5f9a1b15078635406b2bcee2abf28f3255698a14164" +
 			"dea076a3b359550db039476b29afb2cf0817be0c2f9cab8089d45f47f2aecb0d" +
 			"565e064e0248f1aeca1073bbc7679c1f3ca6789069a85ba401f80ee324ad2ea7",
-		sigType: SigType_ECDSA,
-	},
-	{
+		sigType: SigTypeECDSA,
+	}
+	jwkP521 = jwkVector{
 		name: "P-521",
 		jwk:  `{"kty":"EC","crv":"P-521","x":"AXV1zjdoQOKEVmjeRducHwsaFP7KwsT8cowwBjdtmo06sfM0psFcFMe7C0SF2mpguVTXYxJoymBzvlv6GnnD8hDK","y":"AD343AwrlJjZ81j4c71ra8vScMHcoq1W9_3REl0vZQmaxvRSj8c7McB-4q1ZIz3RdXJ0qY0MNmJNuK3wT51WpmDL"}`,
 		msg:  "jwk test message for P-521",
@@ -551,96 +340,75 @@ var jwkVectors = []jwkVector{
 			"644a00b2d14c658b362d26d6cb1391e2b63c919334cc8fa0b6047602edddbb51" +
 			"c3148f269fd447abf0618b43ddcabb42fc4c7fd6e2115f6298c65263c1b542bb" +
 			"a4d9c438",
-		sigType: SigType_ECDSA,
-	},
-	{
+		sigType: SigTypeECDSA,
+	}
+	jwkEd25519 = jwkVector{
 		name: "Ed25519",
 		jwk:  `{"kty":"OKP","crv":"Ed25519","x":"ht5vVxVpT5ZAWxOcNw_Odgrd3swyV8yeuph7Nr2d_tI"}`,
 		msg:  "jwk test message for Ed25519",
 		sig: "e55cc9083bfb10632b7d22892b9f35b64d9e7e0832f95ec0a2285976f45c705d" +
 			"be525bbc0db99cda112c298b90c6cf046fdb9955e9b9589b12317dcf698c0e0f",
-		sigType: SigType_EDDSA,
-	},
-}
-
-func TestVerifierFromJWK_VerifiesKnownSignature(t *testing.T) {
-	for _, tc := range jwkVectors {
-		t.Run(tc.name, func(t *testing.T) {
-			key, err := jwk.ParseKey([]byte(tc.jwk))
-			if err != nil {
-				t.Fatalf("ParseKey() error = %v", err)
-			}
-			verifier, err := VerifierFromJWK(key)
-			if err != nil {
-				t.Fatalf("VerifierFromJWK() error = %v", err)
-			}
-			if got := verifier.sigType(); got != tc.sigType {
-				t.Fatalf("sigType() = %v, want %v", got, tc.sigType)
-			}
-			switch tc.sigType {
-			case SigType_ECDSA:
-				v, ok := verifier.(*ECDSAVerifier)
-				if !ok {
-					t.Fatalf("verifier type = %T, want *ECDSAVerifier", verifier)
-				}
-				if got := v.pubKey.Curve.Params().Name; got != tc.name {
-					t.Fatalf("curve = %s, want %s", got, tc.name)
-				}
-			case SigType_EDDSA:
-				if _, ok := verifier.(*EDDSAVerifier); !ok {
-					t.Fatalf("verifier type = %T, want *EDDSAVerifier", verifier)
-				}
-			}
-
-			msg := []byte(tc.msg)
-			sig := mustDecodeHex(t, tc.sig)
-			ok, err := verifier.verify(msg, sig)
-			if err != nil {
-				t.Fatalf("verify() error = %v", err)
-			}
-			if !ok {
-				t.Fatal("verify() = false, want true")
-			}
-
-			tamperedMsg := append(bytes.Clone(msg), '!')
-			assertVerifyRejected(t, verifier, tamperedMsg, sig)
-			tamperedSig := bytes.Clone(sig)
-			tamperedSig[len(tamperedSig)-1] ^= 0x01
-			assertVerifyRejected(t, verifier, msg, tamperedSig)
-		})
+		sigType: SigTypeEDDSA,
 	}
-}
+)
 
 // rsaJWK is a 2048-bit RSA public key, a key type this package does not support.
 const rsaJWK = `{"kty":"RSA","n":"uteGojBE7QA0wW5aS6ALw-7q8EawPWOW-DHBVrmxaDvXuX4sLn2Gj-2ctRIV7paDnQnv4s-6aLMLiibjW8SbOg4555PCkFxvII5Vftw1EwDoliOEFX-kg0MVRlYgS1bSdPIx1-_WneiNUQC8GQf7Rqdud_e340VZU9r3Gaqt5VhQ9rlGUZQr5eOKNDCAD8PnuKQeDd7FzNaAb0_mdRqAzoK_gJfc1ntZAcxQsZ1dd0As8wrD1YdzuPnl_VEp0RcpHZErGS2_CfwAtAQjxk3ZPHzaWVXv8vFAdHKhV4kOEviRWCk2lucebr4I47RPQXmlJJzME7FhY1qPWO3gEyoosQ","e":"AQAB"}`
 
-func TestVerifierFromJWK_RSAUnsupported(t *testing.T) {
-	key, err := jwk.ParseKey([]byte(rsaJWK))
+func mustParseJWK(t *testing.T, raw string) jwk.Key {
+	t.Helper()
+	key, err := jwk.ParseKey([]byte(raw))
 	if err != nil {
-		t.Fatalf("ParseKey() error = %v", err)
+		t.Fatalf("jwk.ParseKey: %v", err)
 	}
-	verifier, err := VerifierFromJWK(key)
-	if err == nil {
-		t.Fatalf("VerifierFromJWK() = %T, want error", verifier)
-	}
-	if !strings.Contains(err.Error(), "Unsupported key type") {
-		t.Fatalf("VerifierFromJWK() error = %q, want unsupported key type", err)
+	return key
+}
+
+func TestVerifierFromJWK_KnownSignatures(t *testing.T) {
+	for _, vec := range []jwkVector{jwkP256, jwkP384, jwkP521, jwkEd25519} {
+		t.Run(vec.name, func(t *testing.T) {
+			t.Parallel()
+			verifier, err := VerifierFromJWK(mustParseJWK(t, vec.jwk))
+			if err != nil {
+				t.Fatalf("VerifierFromJWK: %v", err)
+			}
+			if got := verifier.sigType(); got != vec.sigType {
+				t.Errorf("sigType = %v, want %v", got, vec.sigType)
+			}
+			if v, ok := verifier.(*ECDSAVerifier); ok {
+				if got := v.pubKey.Curve.Params().Name; got != vec.name {
+					t.Errorf("curve = %s, want %s", got, vec.name)
+				}
+			}
+
+			msg, sig := []byte(vec.msg), mustDecodeHex(t, vec.sig)
+			requireSigVerifies(t, verifier, msg, sig)
+			requireSigRejected(t, verifier, append(bytes.Clone(msg), '!'), sig)
+			requireSigRejected(t, verifier, msg, flipBit(sig, len(sig)-1))
+		})
 	}
 }
 
+func TestVerifierFromJWK_RSAUnsupported(t *testing.T) {
+	verifier, err := VerifierFromJWK(mustParseJWK(t, rsaJWK))
+	requireNoVerifier(t, verifier, err, "unsupported key type RSA")
+}
+
+// --- GetAssertionVerifier ---
+
 // assertionTestDIDDoc has one verification method for each case
 // GetAssertionVerifier must handle. Placeholders in braces are replaced with
-// keys from the test vectors above, so a returned verifier can be checked
-// against a known signature.
+// keys from the test vectors, so a returned verifier can be checked against a
+// known signature.
 //   - key-1: P-256 JWK, referenced from assertionMethod by its absolute URL.
 //   - key-2: Ed25519 JWK, listed only under authentication.
 //   - key-3: Ed25519 Multikey, referenced from assertionMethod.
 //   - key-4: malformed JWK, referenced from assertionMethod.
 //   - key-5: Ed25519 JWK embedded directly in assertionMethod.
 //   - key-6: P-256 Multikey, referenced by the relative URL "#key-6".
-//   - key-8: only publicKeyBase58, which is not supported.
-//   - key-9: publicKeyMultibase that is not valid base58.
-//   - key-10: RSA JWK, a key type this package does not support.
+//   - key-7: only publicKeyBase58, which is not supported.
+//   - key-8: publicKeyMultibase that is not valid base58.
+//   - key-9: RSA JWK, a key type this package does not support.
 const assertionTestDIDDoc = `{
   "@context": "https://www.w3.org/ns/did/v1",
   "id": "did:web:example.com:user:101",
@@ -676,19 +444,19 @@ const assertionTestDIDDoc = `{
       "publicKeyMultibase": "{P256_MULTIKEY}"
     },
     {
-      "id": "did:web:example.com:user:101#key-8",
+      "id": "did:web:example.com:user:101#key-7",
       "type": "Ed25519VerificationKey2018",
       "controller": "did:web:example.com:user:101",
       "publicKeyBase58": "B12NYF8RrR3h41TDCTJojY59usg3mbtbjnFs7Eud1Y6u"
     },
     {
-      "id": "did:web:example.com:user:101#key-9",
+      "id": "did:web:example.com:user:101#key-8",
       "type": "Multikey",
       "controller": "did:web:example.com:user:101",
       "publicKeyMultibase": "z0OIl"
     },
     {
-      "id": "did:web:example.com:user:101#key-10",
+      "id": "did:web:example.com:user:101#key-9",
       "type": "JsonWebKey2020",
       "controller": "did:web:example.com:user:101",
       "publicKeyJwk": {RSA_JWK}
@@ -706,85 +474,71 @@ const assertionTestDIDDoc = `{
       "publicKeyJwk": {ED25519_JWK}
     },
     "#key-6",
+    "did:web:example.com:user:101#key-7",
     "did:web:example.com:user:101#key-8",
-    "did:web:example.com:user:101#key-9",
-    "did:web:example.com:user:101#key-10"
+    "did:web:example.com:user:101#key-9"
   ]
 }`
-
-// signedMessage is a message and a signature over it that a verifier for the
-// right key accepts. msg is what SigVerifier.verify takes, before its own hashing.
-type signedMessage struct {
-	msg []byte
-	sig []byte
-}
-
-// assertionTestVectors returns the known signatures for the keys used in
-// assertionTestDIDDoc, by vector name.
-func assertionTestVectors(t *testing.T) map[string]signedMessage {
-	t.Helper()
-	p256 := findECDSAVector(t, "P-256")
-	p256JWK := findJWKVector(t, "P-256")
-	ed25519JWK := findJWKVector(t, "Ed25519")
-	return map[string]signedMessage{
-		"P-256 JWK":        {msg: []byte(p256JWK.msg), sig: mustDecodeHex(t, p256JWK.sig)},
-		"Ed25519 JWK":      {msg: []byte(ed25519JWK.msg), sig: mustDecodeHex(t, ed25519JWK.sig)},
-		"P-256 Multikey":   {msg: mustDecodeHex(t, p256.digest), sig: mustDecodeHex(t, p256.sig)},
-		"Ed25519 Multikey": {msg: mustDecodeHex(t, ed25519Digest), sig: mustDecodeHex(t, ed25519Sig)},
-	}
-}
-
-func findJWKVector(t *testing.T, name string) jwkVector {
-	t.Helper()
-	for _, vec := range jwkVectors {
-		if vec.name == name {
-			return vec
-		}
-	}
-	t.Fatalf("test setup: no JWK vector named %s", name)
-	return jwkVector{}
-}
-
-func findECDSAVector(t *testing.T, name string) multikeyVector {
-	t.Helper()
-	for _, vec := range ecdsaJCSVectors {
-		if vec.name == name {
-			return vec
-		}
-	}
-	t.Fatalf("test setup: no ECDSA vector named %s", name)
-	return multikeyVector{}
-}
 
 func parseAssertionTestDIDDoc(t *testing.T) *did.Document {
 	t.Helper()
 	raw := strings.NewReplacer(
-		"{P256_JWK}", findJWKVector(t, "P-256").jwk,
-		"{ED25519_JWK}", findJWKVector(t, "Ed25519").jwk,
-		"{P256_MULTIKEY}", findECDSAVector(t, "P-256").key,
-		"{ED25519_MULTIKEY}", ed25519PublicKey,
+		"{P256_JWK}", jwkP256.jwk,
+		"{ED25519_JWK}", jwkEd25519.jwk,
+		"{P256_MULTIKEY}", vectorP256.publicKey,
+		"{ED25519_MULTIKEY}", vectorEd25519.publicKey,
 		"{RSA_JWK}", rsaJWK,
 	).Replace(assertionTestDIDDoc)
 	doc, err := did.ParseDocument(raw)
 	if err != nil {
-		t.Fatalf("ParseDocument: %v", err)
+		t.Fatalf("did.ParseDocument: %v", err)
 	}
 	return doc
 }
 
+func requireAssertionVerifierError(t *testing.T, doc *did.Document, keyURL *did.DIDURL, want string) {
+	t.Helper()
+	verifier, err := GetAssertionVerifier(doc, keyURL)
+	requireNoVerifier(t, verifier, err, want)
+}
+
 func TestGetAssertionVerifier(t *testing.T) {
 	doc := parseAssertionTestDIDDoc(t)
-	vectors := assertionTestVectors(t)
 	tests := []struct {
 		name     string
 		url      string
 		wantType SigType
-		vector   string
+		data     []byte
+		sig      []byte
 	}{
-		{name: "JWK reference", url: "did:web:example.com:user:101#key-1", wantType: SigType_ECDSA, vector: "P-256 JWK"},
-		{name: "embedded JWK", url: "did:web:example.com:user:101#key-5", wantType: SigType_EDDSA, vector: "Ed25519 JWK"},
-		{name: "Multikey reference", url: "did:web:example.com:user:101#key-3", wantType: SigType_EDDSA, vector: "Ed25519 Multikey"},
-		{name: "relative Multikey reference", url: "did:web:example.com:user:101#key-6", wantType: SigType_ECDSA, vector: "P-256 Multikey"},
+		{
+			name:     "JWK reference",
+			url:      "did:web:example.com:user:101#key-1",
+			wantType: SigTypeECDSA,
+			data:     []byte(jwkP256.msg),
+			sig:      mustDecodeHex(t, jwkP256.sig),
+		},
+		{
+			name:     "embedded JWK",
+			url:      "did:web:example.com:user:101#key-5",
+			wantType: SigTypeEDDSA,
+			data:     []byte(jwkEd25519.msg),
+			sig:      mustDecodeHex(t, jwkEd25519.sig),
+		},
+		{
+			name:     "Multikey reference",
+			url:      "did:web:example.com:user:101#key-3",
+			wantType: SigTypeEDDSA,
+			data:     mustDecodeHex(t, vectorEd25519.hashData),
+			sig:      mustDecodeHex(t, vectorEd25519.signature),
+		},
+		{
+			name:     "relative Multikey reference",
+			url:      "did:web:example.com:user:101#key-6",
+			wantType: SigTypeECDSA,
+			data:     mustDecodeHex(t, vectorP256.hashData),
+			sig:      mustDecodeHex(t, vectorP256.signature),
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -797,15 +551,7 @@ func TestGetAssertionVerifier(t *testing.T) {
 			if got := verifier.sigType(); got != tt.wantType {
 				t.Errorf("sigType = %v, want %v", got, tt.wantType)
 			}
-
-			vec := vectors[tt.vector]
-			ok, err := verifier.verify(vec.msg, vec.sig)
-			if err != nil {
-				t.Fatalf("verify: %v", err)
-			}
-			if !ok {
-				t.Fatal("verifier rejected the known signature for this key")
-			}
+			requireSigVerifies(t, verifier, tt.data, tt.sig)
 		})
 	}
 }
@@ -821,10 +567,10 @@ func TestGetAssertionVerifier_Rejects(t *testing.T) {
 		{name: "unknown fragment", url: "did:web:example.com:user:101#key-99", want: "not found or not an assertion method"},
 		{name: "other DID", url: "did:web:other.example:user:101#key-1", want: "not found or not an assertion method"},
 		{name: "no fragment", url: "did:web:example.com:user:101", want: "not found or not an assertion method"},
-		{name: "malformed JWK", url: "did:web:example.com:user:101#key-4", want: "could not parse public key"},
-		{name: "unsupported key format", url: "did:web:example.com:user:101#key-8", want: "has no publicKeyJwk or publicKeyMultibase"},
-		{name: "malformed Multikey", url: "did:web:example.com:user:101#key-9", want: "Could not make verifier for key did:web:example.com:user:101#key-9"},
-		{name: "unsupported JWK type", url: "did:web:example.com:user:101#key-10", want: "Unsupported key type"},
+		{name: "malformed JWK", url: "did:web:example.com:user:101#key-4", want: "getting JWK for key did:web:example.com:user:101#key-4"},
+		{name: "unsupported key format", url: "did:web:example.com:user:101#key-7", want: "has no publicKeyJwk or publicKeyMultibase"},
+		{name: "malformed Multikey", url: "did:web:example.com:user:101#key-8", want: "making verifier for key did:web:example.com:user:101#key-8"},
+		{name: "unsupported JWK type", url: "did:web:example.com:user:101#key-9", want: "unsupported key type RSA"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -853,7 +599,7 @@ func TestGetAssertionVerifier_WrapsKeyErrors(t *testing.T) {
 		},
 		{
 			name: "Multikey",
-			url:  "did:web:example.com:user:101#key-9",
+			url:  "did:web:example.com:user:101#key-8",
 			wantErr: func(vm *did.VerificationMethod) error {
 				_, err := VerifierFromMultikey(vm.PublicKeyMultibase)
 				return err
@@ -878,16 +624,14 @@ func TestGetAssertionVerifier_WrapsKeyErrors(t *testing.T) {
 func TestGetAssertionVerifier_RejectsTwoKeyFormats(t *testing.T) {
 	keyURL := did.MustParseDIDURL("did:web:example.com:user:101#key-1")
 	var jwkMap map[string]any
-	if err := json.Unmarshal([]byte(findJWKVector(t, "P-256").jwk), &jwkMap); err != nil {
-		t.Fatalf("unmarshal JWK: %v", err)
-	}
+	mustUnmarshal(t, []byte(jwkP256.jwk), &jwkMap)
 	doc := &did.Document{ID: did.MustParseDID("did:web:example.com:user:101")}
 	doc.AddAssertionMethod(&did.VerificationMethod{
 		ID:                 keyURL,
 		Type:               "JsonWebKey2020",
 		Controller:         doc.ID,
 		PublicKeyJwk:       jwkMap,
-		PublicKeyMultibase: findECDSAVector(t, "P-256").key,
+		PublicKeyMultibase: vectorP256.publicKey,
 	})
 	requireAssertionVerifierError(t, doc, &keyURL, "has both publicKeyJwk and publicKeyMultibase")
 }
@@ -909,9 +653,9 @@ func TestGetAssertionVerifier_NilInputs(t *testing.T) {
 		url  *did.DIDURL
 		want string
 	}{
-		{name: "nil document", doc: nil, url: &keyURL, want: "No DID document"},
-		{name: "nil key URL", doc: doc, url: nil, want: "No key URL"},
-		{name: "both nil", doc: nil, url: nil, want: "No DID document"},
+		{name: "nil document", url: &keyURL, want: "no DID document"},
+		{name: "nil key URL", doc: doc, want: "no key URL"},
+		{name: "both nil", want: "no DID document"},
 		{name: "empty document", doc: &did.Document{}, url: &keyURL, want: "not found or not an assertion method"},
 		{name: "nil entry", doc: withNilEntry, url: &keyURL, want: "not found or not an assertion method"},
 	}
@@ -923,16 +667,39 @@ func TestGetAssertionVerifier_NilInputs(t *testing.T) {
 	}
 }
 
-func requireAssertionVerifierError(t *testing.T, doc *did.Document, keyURL *did.DIDURL, want string) {
-	t.Helper()
-	verifier, err := GetAssertionVerifier(doc, keyURL)
-	if err == nil {
-		t.Fatalf("GetAssertionVerifier succeeded with %T", verifier)
+// testdata/did1.json is a DID document as a did:web server would publish it.
+func TestGetAssertionVerifier_FromFile(t *testing.T) {
+	raw, err := os.ReadFile("testdata/did1.json")
+	if err != nil {
+		t.Fatalf("os.ReadFile: %v", err)
 	}
-	if verifier != nil {
-		t.Errorf("GetAssertionVerifier returned %T with error", verifier)
+	var doc did.Document
+	mustUnmarshal(t, raw, &doc)
+
+	keyURL := did.MustParseDIDURL("did:web:example.org:blah#key-1")
+	verifier, err := GetAssertionVerifier(&doc, &keyURL)
+	if err != nil {
+		t.Fatalf("GetAssertionVerifier: %v", err)
 	}
-	if !strings.Contains(err.Error(), want) {
-		t.Fatalf("error = %q, want substring %q", err, want)
+	if got := verifier.sigType(); got != SigTypeECDSA {
+		t.Errorf("sigType = %v, want %v", got, SigTypeECDSA)
+	}
+}
+
+// --- SigType ---
+
+func TestSigType_String(t *testing.T) {
+	tests := []struct {
+		sigType SigType
+		want    string
+	}{
+		{SigTypeECDSA, "ECDSA"},
+		{SigTypeEDDSA, "EdDSA"},
+		{SigType(99), "unknown signature type"},
+	}
+	for _, tt := range tests {
+		if got := tt.sigType.String(); got != tt.want {
+			t.Errorf("SigType(%d).String() = %q, want %q", int(tt.sigType), got, tt.want)
+		}
 	}
 }

@@ -2,775 +2,90 @@ package verifdocs
 
 import (
 	"bytes"
-	"crypto/ecdsa"
 	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/sha256"
-	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"maps"
 	"math"
 	"math/big"
 	"regexp"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/gowebpki/jcs"
 	ssi "github.com/nuts-foundation/go-did"
 	"github.com/nuts-foundation/go-did/did"
 )
 
-const ExampleDoc = `{
-  "@context": [
-    "https://www.w3.org/ns/activitystreams",
-    "https://w3id.org/security/data-integrity/v1"
-  ],
-  "id": "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jFuXzM2yZjnjJa3321",
-  "type": "Person",
-  "name": "Alice",
-  "preferredUsername": "alice",
-  "summary": "Building a decentralized social app",
-  "icon": {
-    "type": "Image",
-    "url": "https://example.com/alice.jpg"
-  },
-  "proof": {
-    "type": "DataIntegrityProof",
-    "cryptosuite": "eddsa-rdfc-2022",
-    "created": "2026-03-28T15:40:00Z",
-    "verificationMethod": "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jFuXzM2yZjnjJa3321#z6MkpTHR8VNsBxYAAWHut2Geadd9jFuXzM2yZjnjJa3321",
-    "proofPurpose": "assertionMethod",
-    "proofValue": "z1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
-	"habla": "blah"
-  }
-}`
+// --- Helpers ---
 
-func TestParseProof(t *testing.T) {
-	var document map[string]json.RawMessage
-	_ = json.Unmarshal([]byte(ExampleDoc), &document)
-	var proof Proof
-	if err := json.Unmarshal(document["proof"], &proof); err != nil {
-		t.Errorf("Could not parse proof: %s", err)
-		return
-	}
-	if proof.ProofType != "DataIntegrityProof" {
-		t.Errorf("Proof type does not match expected, got %s expected %s", proof.ProofType, "DataIntegrityProof")
-	}
-	if proof.ProofPurpose != "assertionMethod" {
-		t.Errorf("Proof purpose does not match expected, got %s expected %s", proof.ProofPurpose, "assertionMethod")
-	}
-	if proof.CryptoSuite != CryptoSuite_EDDSA_RDFC_2022 {
-		t.Errorf("Cryptosuite does not match expected, got %s expected %s", proof.CryptoSuite, CryptoSuiteType(CryptoSuite_EDDSA_RDFC_2022))
-	}
-	if proof.VerificationMethod.String() != "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jFuXzM2yZjnjJa3321#z6MkpTHR8VNsBxYAAWHut2Geadd9jFuXzM2yZjnjJa3321" {
-		t.Errorf("Verification method does not match expected, got %s expected %s", proof.VerificationMethod.String(), "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jFuXzM2yZjnjJa3321#z6MkpTHR8VNsBxYAAWHut2Geadd9jFuXzM2yZjnjJa3321")
-	}
-	expValue := []byte{
-		0x00, 0x62, 0xe9, 0x07, 0xb1, 0x5c, 0xbf, 0x27,
-		0xd5, 0x42, 0x53, 0x99, 0xeb, 0xf6, 0xf0, 0xfb,
-		0x50, 0xeb, 0xb8, 0x8f, 0x18, 0xc2, 0x9b, 0x7d,
-		0x93,
-	}
-	if !bytes.Equal(proof.ProofValue, expValue) {
-		t.Errorf("Proof value not as expected, got %x expectd %x", proof.ProofValue, expValue)
-	}
-	exp_time := time.Date(2026, 03, 28, 15, 40, 0, 0, time.UTC)
-	if proof.Created != exp_time {
-		t.Errorf("Proof creation time not as expected: got %s expected %s", proof.Created, exp_time)
-	}
+const testKeyURL = "did:web:example.com:user:101#key-1"
+
+func sampleDoc() map[string]any {
+	return map[string]any{"id": 101, "name": "Alice"}
 }
 
-const (
-	exCredentialWithoutProof = `{
-    "@context": [
-        "https://www.w3.org/ns/credentials/v2",
-        "https://www.w3.org/ns/credentials/examples/v2"
-    ],
-    "id": "urn:uuid:58172aac-d8ba-11ed-83dd-0b3aef56cc33",
-    "type": ["VerifiableCredential", "AlumniCredential"],
-    "name": "Alumni Credential",
-    "description": "A minimum viable example of an Alumni Credential.",
-    "issuer": "https://vc.example/issuers/5678",
-    "validFrom": "2023-01-01T00:00:00Z",
-    "credentialSubject": {
-        "id": "did:example:abcdefgh",
-        "alumniOf": "The School of Examples"
-    }
-}`
-	exProofOptions = `{
-  "type": "DataIntegrityProof",
-  "cryptosuite": "ecdsa-jcs-2019",
-  "created": "2023-02-24T23:36:38Z",
-  "verificationMethod": "did:key:zDnaepBuvsQ8cpsWrVKw8fbpGpvPeNSjVPTWoq6cRqaYzBKVP#zDnaepBuvsQ8cpsWrVKw8fbpGpvPeNSjVPTWoq6cRqaYzBKVP",
-  "proofPurpose": "assertionMethod",
-  "@context": [
-    "https://www.w3.org/ns/credentials/v2",
-    "https://www.w3.org/ns/credentials/examples/v2"
-  ]
-}`
-	exCredentialJCSCanon = `{"@context":["https://www.w3.org/ns/credentials/v2","https://www.w3.org/ns/credentials/examples/v2"],"credentialSubject":{"alumniOf":"The School of Examples","id":"did:example:abcdefgh"},"description":"A minimum viable example of an Alumni Credential.","id":"urn:uuid:58172aac-d8ba-11ed-83dd-0b3aef56cc33","issuer":"https://vc.example/issuers/5678","name":"Alumni Credential","type":["VerifiableCredential","AlumniCredential"],"validFrom":"2023-01-01T00:00:00Z"}`
-	exProofJCSCanon      = `{"@context":["https://www.w3.org/ns/credentials/v2","https://www.w3.org/ns/credentials/examples/v2"],"created":"2023-02-24T23:36:38Z","cryptosuite":"ecdsa-jcs-2019","proofPurpose":"assertionMethod","type":"DataIntegrityProof","verificationMethod":"did:key:zDnaepBuvsQ8cpsWrVKw8fbpGpvPeNSjVPTWoq6cRqaYzBKVP#zDnaepBuvsQ8cpsWrVKw8fbpGpvPeNSjVPTWoq6cRqaYzBKVP"}`
-	exFullCredential     = `{
-  "@context": [
-    "https://www.w3.org/ns/credentials/v2",
-    "https://www.w3.org/ns/credentials/examples/v2"
-  ],
-  "id": "urn:uuid:58172aac-d8ba-11ed-83dd-0b3aef56cc33",
-  "type": [
-    "VerifiableCredential",
-    "AlumniCredential"
-  ],
-  "name": "Alumni Credential",
-  "description": "A minimum viable example of an Alumni Credential.",
-  "issuer": "https://vc.example/issuers/5678",
-  "validFrom": "2023-01-01T00:00:00Z",
-  "credentialSubject": {
-    "id": "did:example:abcdefgh",
-    "alumniOf": "The School of Examples"
-  },
-  "proof": {
-    "type": "DataIntegrityProof",
-    "cryptosuite": "ecdsa-jcs-2019",
-    "created": "2023-02-24T23:36:38Z",
-    "verificationMethod": "did:key:zDnaepBuvsQ8cpsWrVKw8fbpGpvPeNSjVPTWoq6cRqaYzBKVP#zDnaepBuvsQ8cpsWrVKw8fbpGpvPeNSjVPTWoq6cRqaYzBKVP",
-    "proofPurpose": "assertionMethod",
-    "@context": [
-      "https://www.w3.org/ns/credentials/v2",
-      "https://www.w3.org/ns/credentials/examples/v2"
-    ],
-    "proofValue": "z5ptCet75SaEgzG4v4zJhbJtfNi74Wv7Fq15hhKouJQQjEPQvPZKaYxcMXAMLPQS2FXrkCWokNJkFVkwxNzZfD5oT"
-  }
-}`
-)
-
-func TestJCSCanonicalize(t *testing.T) {
-	// First just check that our canonicalizer works
-	bodyCanon, err := jcs.Transform([]byte(exCredentialWithoutProof))
+func mustMakeVerifiableDoc(t *testing.T, doc any, cs CryptoSuiteType) VerifiableDoc {
+	t.Helper()
+	vm := did.MustParseDIDURL(testKeyURL)
+	vd, err := MakeVerifiableDoc(doc, cs, &vm)
 	if err != nil {
-		t.Errorf("Error canonicalizing body: %s", err)
-	} else if string(bodyCanon) != exCredentialJCSCanon {
-		t.Errorf("Canonicalized body does not match expected.\nGot: %s\nExpected: %s\n", string(bodyCanon), exCredentialJCSCanon)
+		t.Fatalf("MakeVerifiableDoc: %v", err)
 	}
+	return vd
+}
 
-	proofCanon, err := jcs.Transform([]byte(exProofOptions))
+func mustECDSASigner(t *testing.T) *ECDSASigner {
+	t.Helper()
+	signer, err := GenerateECDSASigner(elliptic.P256())
 	if err != nil {
-		t.Errorf("Error canonicalizing proof options: %s", err)
-	} else if string(proofCanon) != exProofJCSCanon {
-		t.Errorf("Canonicalized proof options does not match expected.\nGot: %s\nExpected: %s\n", string(proofCanon), exProofJCSCanon)
+		t.Fatalf("GenerateECDSASigner: %v", err)
 	}
+	return signer
 }
 
-func sha256hash(data []byte) []byte {
-	sum := sha256.Sum256(data)
-	return sum[:]
-}
-
-func sha384hash(data []byte) []byte {
-	sum := sha512.Sum384(data)
-	return sum[:]
-}
-
-func TestJCSHash(t *testing.T) {
-	hasher := JCSHasher(sha256hash)
-	expHash := "fe5799489119c7fe3c528715e72bd39d2ec6b4ab345978df32e9a9312648ec2559b7cb6251b8991add1ce0bc83107e3db9dbbab5bd2c28f687db1a03abc92f19"
-	result, err := hasher.Hash([]byte(exCredentialWithoutProof), []byte(exProofOptions))
+func mustSign(t *testing.T, vd *VerifiableDoc, signer Signer) []byte {
+	t.Helper()
+	signed, err := vd.Sign(signer)
 	if err != nil {
-		t.Errorf("Error hashing doc: %s", err)
-	} else if hex.EncodeToString(result) != expHash {
-		t.Errorf("Resulting hash does not match expected.\nGot: %s\nExpected: %s", hex.EncodeToString(result), expHash)
+		t.Fatalf("Sign: %v", err)
 	}
+	return signed
 }
 
-func TestGetHash_ECDSAJCS(t *testing.T) {
-	doc, err := ParseDoc([]byte(exFullCredential))
+func mustParseDoc(t *testing.T, data []byte) VerifiableDoc {
+	t.Helper()
+	vd, err := ParseDoc(data)
 	if err != nil {
 		t.Fatalf("ParseDoc: %v", err)
 	}
-	if doc.Proof.CryptoSuite != CryptoSuite_ECDSA_JCS_2019 {
-		t.Fatalf("cryptosuite = %s, want ecdsa-jcs-2019", doc.Proof.CryptoSuite)
-	}
-
-	// P-256: SHA-256 of the canonical proof, then SHA-256 of the canonical document.
-	const want = "fe5799489119c7fe3c528715e72bd39d2ec6b4ab345978df32e9a9312648ec25" +
-		"59b7cb6251b8991add1ce0bc83107e3db9dbbab5bd2c28f687db1a03abc92f19"
-
-	got, err := doc.GetHash(sha256hash)
-	if err != nil {
-		t.Fatalf("GetHash: %v", err)
-	}
-	if hex.EncodeToString(got) != want {
-		t.Errorf("GetHash = %x, want %s", got, want)
-	}
+	return vd
 }
 
-// P-384 ecdsa-jcs-2019 vectors from
-// https://w3c.github.io/vc-di-ecdsa/#representation-ecdsa-jcs-2019-with-curve-p-384
-// Parsing succeeds. GetHash and Verify still use SHA-256, so those tests fail.
-const (
-	exP384PublicKey = "z82LkuBieyGShVBhvtE2zoiD6Kma4tJGFtkAhxR5pfkp5QPw4LutoYWhvQCnGjdVn14kujQ"
-	// SHA-384(canonical proof) || SHA-384(canonical document).
-	exP384CombinedHash = "83e5057817abb0c6872eafeaba1a9e53893c58eeb7414fb6d8aa3fa8c7917f7a" +
-		"d4792890b257c598baa17f4fbe6d183c" +
-		"3e0be671cc1881035d463158c80921973dab3534d4f8dfacf4ff2725a4115eb7" +
-		"18e49d66de0e90e7365cd6062abf2259"
-	exP384Signature = "8b7462ce62db0c8ff19878c4b3561c49eb71b4a743086b6d5b0eda70ecf0afc5" +
-		"a03fd88eb207d66b262ed87fd200a4e8e62716e0b329c032b67726b4b0fc737a" +
-		"44c1cefdba2fdccb3ece74cc5845aaa93374455a726f6ee4f5f30da9427f608a"
-	exP384Credential = `{
-  "@context": [
-    "https://www.w3.org/ns/credentials/v2",
-    "https://www.w3.org/ns/credentials/examples/v2"
-  ],
-  "id": "urn:uuid:58172aac-d8ba-11ed-83dd-0b3aef56cc33",
-  "type": ["VerifiableCredential", "AlumniCredential"],
-  "name": "Alumni Credential",
-  "description": "A minimum viable example of an Alumni Credential.",
-  "issuer": "https://vc.example/issuers/5678",
-  "validFrom": "2023-01-01T00:00:00Z",
-  "credentialSubject": {
-    "id": "did:example:abcdefgh",
-    "alumniOf": "The School of Examples"
-  },
-  "proof": {
-    "type": "DataIntegrityProof",
-    "cryptosuite": "ecdsa-jcs-2019",
-    "created": "2023-02-24T23:36:38Z",
-    "verificationMethod": "did:key:z82LkuBieyGShVBhvtE2zoiD6Kma4tJGFtkAhxR5pfkp5QPw4LutoYWhvQCnGjdVn14kujQ#z82LkuBieyGShVBhvtE2zoiD6Kma4tJGFtkAhxR5pfkp5QPw4LutoYWhvQCnGjdVn14kujQ",
-    "proofPurpose": "assertionMethod",
-    "@context": [
-      "https://www.w3.org/ns/credentials/v2",
-      "https://www.w3.org/ns/credentials/examples/v2"
-    ],
-    "proofValue": "zq3EuTeLiGurmB2JR5oL8oWEsT7u2tba4HT1oZbiMYWc5qzsoW2kLYcBcF4HM5vCpJyTkceULKrVXuJQkXeN5seL4uXrFNFRMm53GWy1Yrto8rTWxZi9DkNeWP7yUPs7ELAm"
-  }
-}`
-)
-
-func TestParseDoc_ECDSAJCS_P384(t *testing.T) {
-	doc := mustParseCredential(t, exP384Credential)
-
-	if doc.Proof.CryptoSuite != CryptoSuite_ECDSA_JCS_2019 {
-		t.Errorf("cryptosuite = %s, want ecdsa-jcs-2019", doc.Proof.CryptoSuite)
-	}
-	if doc.Proof.ProofType != "DataIntegrityProof" {
-		t.Errorf("proof type = %q, want DataIntegrityProof", doc.Proof.ProofType)
-	}
-	if doc.Proof.ProofPurpose != "assertionMethod" {
-		t.Errorf("proof purpose = %q, want assertionMethod", doc.Proof.ProofPurpose)
-	}
-	if doc.Proof.VerificationMethod.ID != exP384PublicKey {
-		t.Errorf("verification method = %s, want %s", doc.Proof.VerificationMethod.ID, exP384PublicKey)
-	}
-	if got := hex.EncodeToString(doc.Proof.ProofValue); got != exP384Signature {
-		t.Errorf("proof value = %s, want %s", got, exP384Signature)
-	}
-}
-
-func TestGetHash_ECDSAJCS_P384(t *testing.T) {
-	doc := mustParseCredential(t, exP384Credential)
-
-	got, err := doc.GetHash(sha384hash)
-	if err != nil {
-		t.Fatalf("GetHash: %v", err)
-	}
-	if hex.EncodeToString(got) != exP384CombinedHash {
-		t.Errorf("GetHash = %x, want %s", got, exP384CombinedHash)
-	}
-}
-
-func TestVerify_ECDSAJCS_P384(t *testing.T) {
-	doc := mustParseCredential(t, exP384Credential)
-	verifier, err := VerifierFromMultikey(exP384PublicKey)
-	if err != nil {
-		t.Fatalf("VerifierFromMultikey: %v", err)
-	}
-
-	ok, err := doc.Verify(verifier)
-	if err != nil {
-		t.Fatalf("Verify: %v", err)
-	}
-	if !ok {
-		t.Fatal("Verify returned false")
-	}
-}
-
-// eddsa-jcs-2022 vectors from Appendix B.3 of
-// https://w3c.github.io/vc-di-eddsa/#representation-eddsa-jcs-2022
-// The unsigned credential is exCredentialWithoutProof; its canonical form is
-// exCredentialJCSCanon. Only the proof options differ from the P-256 vector.
-const (
-	exEd25519PublicKey = "z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2"
-	exEd25519ProofHash = "66ab154f5c2890a140cb8388a22a160454f80575f6eae09e5a097cabe539a1db"
-	exEd25519DocHash   = "59b7cb6251b8991add1ce0bc83107e3db9dbbab5bd2c28f687db1a03abc92f19"
-	exEd25519Signature = "407cd12654b33d718ecbb99179a1506daaa849450bf3fc523cce3e1c96f8b803" +
-		"51da3f253d725c6f00b07c9e5448d50b3ef78012b9ab54255116d069c6dd2808"
-	exEd25519ProofCanon   = `{"@context":["https://www.w3.org/ns/credentials/v2","https://www.w3.org/ns/credentials/examples/v2"],"created":"2023-02-24T23:36:38Z","cryptosuite":"eddsa-jcs-2022","proofPurpose":"assertionMethod","type":"DataIntegrityProof","verificationMethod":"did:key:z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2#z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2"}`
-	exEd25519ProofOptions = `{
-  "type": "DataIntegrityProof",
-  "cryptosuite": "eddsa-jcs-2022",
-  "created": "2023-02-24T23:36:38Z",
-  "verificationMethod": "did:key:z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2#z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2",
-  "proofPurpose": "assertionMethod",
-  "@context": [
-    "https://www.w3.org/ns/credentials/v2",
-    "https://www.w3.org/ns/credentials/examples/v2"
-  ]
-}`
-	exEd25519Credential = `{
-  "@context": [
-    "https://www.w3.org/ns/credentials/v2",
-    "https://www.w3.org/ns/credentials/examples/v2"
-  ],
-  "id": "urn:uuid:58172aac-d8ba-11ed-83dd-0b3aef56cc33",
-  "type": [
-    "VerifiableCredential",
-    "AlumniCredential"
-  ],
-  "name": "Alumni Credential",
-  "description": "A minimum viable example of an Alumni Credential.",
-  "issuer": "https://vc.example/issuers/5678",
-  "validFrom": "2023-01-01T00:00:00Z",
-  "credentialSubject": {
-    "id": "did:example:abcdefgh",
-    "alumniOf": "The School of Examples"
-  },
-  "proof": {
-    "type": "DataIntegrityProof",
-    "cryptosuite": "eddsa-jcs-2022",
-    "created": "2023-02-24T23:36:38Z",
-    "verificationMethod": "did:key:z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2#z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2",
-    "proofPurpose": "assertionMethod",
-    "@context": [
-      "https://www.w3.org/ns/credentials/v2",
-      "https://www.w3.org/ns/credentials/examples/v2"
-    ],
-    "proofValue": "z2HnFSSPPBzR36zdDgK8PbEHeXbR56YF24jwMpt3R1eHXQzJDMWS93FCzpvJpwTWd3GAVFuUfjoJdcnTMuVor51aX"
-  }
-}`
-)
-
-func TestJCSCanonicalize_EDDSA(t *testing.T) {
-	proofCanon, err := jcs.Transform([]byte(exEd25519ProofOptions))
-	if err != nil {
-		t.Fatalf("canonicalizing proof options: %v", err)
-	}
-	if string(proofCanon) != exEd25519ProofCanon {
-		t.Errorf("canonical proof = %s, want %s", proofCanon, exEd25519ProofCanon)
-	}
-}
-
-func TestJCSHash_EDDSA(t *testing.T) {
-	result, err := JCSHasher(sha256hash).Hash([]byte(exCredentialWithoutProof), []byte(exEd25519ProofOptions))
-	if err != nil {
-		t.Fatalf("Hash: %v", err)
-	}
-	got := hex.EncodeToString(result)
-	if len(got) != len(exEd25519ProofHash)+len(exEd25519DocHash) {
-		t.Fatalf("hash length = %d hex chars, want %d", len(got), len(exEd25519ProofHash)+len(exEd25519DocHash))
-	}
-	if got[:len(exEd25519ProofHash)] != exEd25519ProofHash {
-		t.Errorf("proof hash = %s, want %s", got[:len(exEd25519ProofHash)], exEd25519ProofHash)
-	}
-	if got[len(exEd25519ProofHash):] != exEd25519DocHash {
-		t.Errorf("document hash = %s, want %s", got[len(exEd25519ProofHash):], exEd25519DocHash)
-	}
-}
-
-func TestParseDoc_EDDSAJCS(t *testing.T) {
-	doc := mustParseCredential(t, exEd25519Credential)
-
-	if doc.Proof.CryptoSuite != CryptoSuite_EDDSA_JCS_2022 {
-		t.Errorf("cryptosuite = %s, want eddsa-jcs-2022", doc.Proof.CryptoSuite)
-	}
-	if doc.Proof.ProofType != "DataIntegrityProof" {
-		t.Errorf("proof type = %q, want DataIntegrityProof", doc.Proof.ProofType)
-	}
-	if doc.Proof.ProofPurpose != "assertionMethod" {
-		t.Errorf("proof purpose = %q, want assertionMethod", doc.Proof.ProofPurpose)
-	}
-	if doc.Proof.VerificationMethod.ID != exEd25519PublicKey {
-		t.Errorf("verification method = %s, want %s", doc.Proof.VerificationMethod.ID, exEd25519PublicKey)
-	}
-	if got := hex.EncodeToString(doc.Proof.ProofValue); got != exEd25519Signature {
-		t.Errorf("proof value = %s, want %s", got, exEd25519Signature)
-	}
-	if bytes.Contains(doc.Body, []byte(`"proof"`)) {
-		t.Error("proof was left in the body")
-	}
-}
-
-func TestGetHash_EDDSAJCS(t *testing.T) {
-	doc := mustParseCredential(t, exEd25519Credential)
-
-	got, err := doc.GetHash(sha256hash)
-	if err != nil {
-		t.Fatalf("GetHash: %v", err)
-	}
-	want := exEd25519ProofHash + exEd25519DocHash
-	if hex.EncodeToString(got) != want {
-		t.Errorf("GetHash = %x, want %s", got, want)
-	}
-}
-
-func TestVerify_EDDSAJCS(t *testing.T) {
-	doc := mustParseCredential(t, exEd25519Credential)
-	verifier := mustVerifier(t, exEd25519PublicKey)
-	if verifier.sigType() != SigType_EDDSA {
-		t.Fatalf("sigType = %v, want EdDSA", verifier.sigType())
-	}
-
-	ok, err := doc.Verify(verifier)
-	if err != nil {
-		t.Fatalf("Verify: %v", err)
-	}
-	if !ok {
-		t.Fatal("Verify returned false")
-	}
-}
-
-func TestVerify_EDDSAJCS_RejectsTampering(t *testing.T) {
-	verifier := mustVerifier(t, exEd25519PublicKey)
-	tests := []struct {
-		name    string
-		mutate  func(*testing.T, *VerifiableDoc)
-		wantErr string
-	}{
-		{
-			name: "body",
-			mutate: func(t *testing.T, doc *VerifiableDoc) {
-				const name = `"Alumni Credential"`
-				updated := bytes.Replace(doc.Body, []byte(name), []byte(`"Tampered"`), 1)
-				if bytes.Equal(updated, doc.Body) {
-					t.Fatalf("body has no %s to tamper", name)
-				}
-				doc.Body = updated
-			},
-		},
-		{
-			name: "proof config",
-			mutate: func(t *testing.T, doc *VerifiableDoc) {
-				const created = "2023-02-24T23:36:38Z"
-				updated := bytes.Replace(doc.rawProofOptions, []byte(created), []byte("2024-02-24T23:36:38Z"), 1)
-				if bytes.Equal(updated, doc.rawProofOptions) {
-					t.Fatalf("proof config has no %s to tamper", created)
-				}
-				doc.rawProofOptions = updated
-			},
-		},
-		{
-			name: "signature",
-			mutate: func(_ *testing.T, doc *VerifiableDoc) {
-				doc.Proof.ProofValue[0] ^= 0x01
-			},
-		},
-		{
-			name:    "signature length",
-			wantErr: "wrong signature size",
-			mutate: func(_ *testing.T, doc *VerifiableDoc) {
-				doc.Proof.ProofValue = doc.Proof.ProofValue[:len(doc.Proof.ProofValue)-1]
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			doc := mustParseCredential(t, exEd25519Credential)
-			tt.mutate(t, &doc)
-			assertVerifyFailed(t, doc, verifier, tt.wantErr)
-		})
-	}
-}
-
-func TestVerify_RejectsVerifierSuiteMismatch(t *testing.T) {
-	const ecdsaP256Key = "zDnaepBuvsQ8cpsWrVKw8fbpGpvPeNSjVPTWoq6cRqaYzBKVP"
-	tests := []struct {
-		name string
-		doc  string
-		key  string
-	}{
-		{name: "eddsa document", doc: exEd25519Credential, key: ecdsaP256Key},
-		{name: "ecdsa document", doc: exFullCredential, key: exEd25519PublicKey},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			doc := mustParseCredential(t, tt.doc)
-			assertVerifyFailed(t, doc, mustVerifier(t, tt.key), "does not match")
-		})
-	}
-}
-
-func TestGetHash_UnsupportedCryptoSuite(t *testing.T) {
-	doc := mustParseCredential(t, ExampleDoc)
-	if doc.Proof.CryptoSuite != CryptoSuite_EDDSA_RDFC_2022 {
-		t.Fatalf("cryptosuite = %s, want eddsa-rdfc-2022", doc.Proof.CryptoSuite)
-	}
-
-	_, err := doc.GetHash(sha256hash)
-	if err == nil {
-		t.Fatal("GetHash succeeded")
-	}
-	if !strings.Contains(err.Error(), "Unsupported hashing") {
-		t.Fatalf("error = %q, want an unsupported hashing error", err)
-	}
-}
-
-func TestVerify_UnsupportedCryptoSuite(t *testing.T) {
-	doc := mustParseCredential(t, ExampleDoc)
-	assertVerifyFailed(t, doc, mustVerifier(t, exEd25519PublicKey), "Unsupported hashing")
-}
-
-func mustParseCredential(t *testing.T, document string) VerifiableDoc {
+// signedTestDoc signs doc with the given proof times, then parses the result
+// as a verifier would receive it. It also returns a verifier for the key.
+func signedTestDoc(t *testing.T, doc any, created, expires time.Time) (VerifiableDoc, SigVerifier) {
 	t.Helper()
-	doc, err := ParseDoc([]byte(document))
-	if err != nil {
-		t.Fatalf("ParseDoc: %v", err)
-	}
-	return doc
-}
-
-func mustVerifier(t *testing.T, multikey string) SigVerifier {
-	t.Helper()
-	verifier, err := VerifierFromMultikey(multikey)
-	if err != nil {
-		t.Fatalf("VerifierFromMultikey: %v", err)
-	}
-	return verifier
-}
-
-// wantErr empty means the signature check failed with no error.
-// Otherwise the error text must contain wantErr, and the result must be false.
-func assertVerifyFailed(t *testing.T, doc VerifiableDoc, verifier SigVerifier, wantErr string) {
-	t.Helper()
-	ok, err := doc.Verify(verifier)
-	if ok {
-		t.Fatal("Verify returned true")
-	}
-	if wantErr == "" {
-		if err != nil {
-			t.Fatalf("Verify: %v", err)
-		}
-		return
-	}
-	if err == nil {
-		t.Fatal("Verify returned no error")
-	}
-	if !strings.Contains(err.Error(), wantErr) {
-		t.Fatalf("error = %q, want substring %q", err, wantErr)
-	}
-}
-
-func TestParseVerifDoc(t *testing.T) {
-	doc, err := ParseDoc([]byte(exFullCredential))
-	if err != nil {
-		t.Errorf("Error parsing verif doc: %s", err)
-		return
-	}
-
-	bodyJCS, err := jcs.Transform(doc.Body)
-	if err != nil {
-		t.Errorf("Error canonicalizing body: %s", err)
-	} else if string(bodyJCS) != exCredentialJCSCanon {
-		t.Errorf("Body does not match expected:\nGot %s\nExpected %s", string(bodyJCS), exCredentialJCSCanon)
-	}
-
-	proofJCS, err := jcs.Transform(doc.rawProofOptions)
-	if err != nil {
-		t.Errorf("Error canonicalizing proof: %s", err)
-	} else if string(proofJCS) != exProofJCSCanon {
-		t.Errorf("Proof does not match expected:\nGot %s\nExpected %s", string(proofJCS), exProofJCSCanon)
-	}
-
-	if doc.Proof.ProofType != "DataIntegrityProof" {
-		t.Errorf("Proof type doesn't match expected, got %s, expected %s", doc.Proof.ProofType, "DataIntegrityProof")
-	}
-	const expID = "zDnaepBuvsQ8cpsWrVKw8fbpGpvPeNSjVPTWoq6cRqaYzBKVP"
-	if doc.Proof.VerificationMethod.ID != expID {
-		t.Errorf("Proof ID doesn't match expected.\nGot: %s\nExp: %s", doc.Proof.VerificationMethod.ID, expID)
-	}
-
-	sigHex := hex.EncodeToString(doc.Proof.ProofValue)
-	const expSig = "f15c3b599eb9b3cad05df9d8e8b39a70a86375833b53743c764ac0a88c4457d60707fd7d073e03d906130631d87803f80a9824dc9939632ba92d418181be9d16"
-	if sigHex != expSig {
-		t.Errorf("Sig does not match expected,\nGot: %s\nExp: %s", sigHex, expSig)
-	}
-}
-
-func TestParseDoc_MissingProof(t *testing.T) {
-	requireParseDocError(t, `{"id":"urn:example:1"}`, "Doc has no proof section")
-}
-
-func TestParseDoc_MalformedJSON(t *testing.T) {
-	requireParseDocError(t, `{"id":`, "Error parsing doc:")
-}
-
-func TestParseDoc_MalformedProof(t *testing.T) {
-	requireParseDocError(t, `{"id":"urn:example:1","proof":{"type":}}`, "Error parsing doc:")
-}
-
-func TestParseDoc_MalformedNonProofField(t *testing.T) {
-	// credentialSubject is not valid JSON. ParseDoc only decodes the top-level
-	// object and leaves every other field raw, so this still parses.
-	document := `{
-		"id": "urn:example:1",
-		"credentialSubject": "{not: valid}",
-		"proof": ` + proofJSON(t, validProofFields()) + `
-	}`
-
-	doc, err := ParseDoc([]byte(document))
-	if err != nil {
-		t.Fatalf("ParseDoc: %v", err)
-	}
-	var body map[string]json.RawMessage
-	if err := json.Unmarshal(doc.Body, &body); err != nil {
-		t.Fatalf("body: %v", err)
-	}
-	got, ok := body["credentialSubject"]
-	if !ok {
-		t.Fatal("credentialSubject was dropped")
-	}
-	const want = `"{not: valid}"`
-	if string(got) != want {
-		t.Errorf("credentialSubject = %s, want %s", got, want)
-	}
-	if _, ok := body["proof"]; ok {
-		t.Error("proof was left in the body")
-	}
-	if doc.Proof.ProofType != "DataIntegrityProof" || doc.Proof.ProofPurpose != "assertionMethod" {
-		t.Errorf("proof = type %q purpose %q", doc.Proof.ProofType, doc.Proof.ProofPurpose)
-	}
-}
-
-func TestParseDoc_ProofDoesNotUnmarshal(t *testing.T) {
-	tests := []struct {
-		name  string
-		proof string
-	}{
-		{name: "array", proof: `[1, 2, 3]`},
-		{
-			name:  "unknown cryptosuite",
-			proof: `{"type":"DataIntegrityProof","proofPurpose":"assertionMethod","cryptosuite":"nope"}`,
-		},
-		{
-			name:  "created",
-			proof: `{"type":"DataIntegrityProof","proofPurpose":"assertionMethod","created":"yesterday"}`,
-		},
-		{
-			name:  "proof value",
-			proof: `{"type":"DataIntegrityProof","proofPurpose":"assertionMethod","cryptosuite":"eddsa-jcs-2022","proofValue":"not-valid"}`,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			requireParseDocError(t, docWithProof(tt.proof), "Error parsing doc proof")
-		})
-	}
-}
-
-func TestParseDoc_WrongTypeOrPurpose(t *testing.T) {
-	tests := []struct {
-		name  string
-		proof string
-		want  string
-	}{
-		{
-			name:  "type",
-			proof: `{"type":"Ed25519Signature2020","proofPurpose":"assertionMethod"}`,
-			want:  "Unsupported proof type: Ed25519Signature2020",
-		},
-		{
-			name:  "purpose",
-			proof: `{"type":"DataIntegrityProof","proofPurpose":"authentication"}`,
-			want:  "Unsupported proof purpose: authentication",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			requireParseDocError(t, docWithProof(tt.proof), tt.want)
-		})
-	}
-}
-
-// ParseDoc requires every field that a Data Integrity proof must carry.
-// A value that is present but empty or null counts as missing.
-func TestParseDoc_MissingProofFields(t *testing.T) {
-	tests := []struct {
-		name   string
-		remove string
-		set    any // used instead of removing the field when not nil
-		want   string
-	}{
-		{name: "no type", remove: "type", want: "Unsupported proof type: "},
-		{name: "empty type", remove: "type", set: "", want: "Unsupported proof type: "},
-		{name: "no purpose", remove: "proofPurpose", want: "Unsupported proof purpose: "},
-		{name: "empty purpose", remove: "proofPurpose", set: "", want: "Unsupported proof purpose: "},
-		{name: "no cryptosuite", remove: "cryptosuite", want: "Proof has no cryptosuite"},
-		{name: "no verification method", remove: "verificationMethod", want: "Proof has no verificationMethod"},
-		{name: "null verification method", remove: "verificationMethod", set: json.RawMessage("null"), want: "Proof has no verificationMethod"},
-		{name: "no proof value", remove: "proofValue", want: "Proof has no proofValue"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			fields := validProofFields()
-			delete(fields, tt.remove)
-			if tt.set != nil {
-				fields[tt.remove] = tt.set
-			}
-			requireParseDocError(t, docWithProof(proofJSON(t, fields)), tt.want)
-		})
-	}
-}
-
-// The checks above must not reject a proof that has every required field.
-func TestParseDoc_MinimalValidProof(t *testing.T) {
-	doc := mustParseCredential(t, docWithProof(proofJSON(t, validProofFields())))
-	if doc.Proof.CryptoSuite != CryptoSuite_ECDSA_JCS_2019 {
-		t.Errorf("cryptosuite = %s, want ecdsa-jcs-2019", doc.Proof.CryptoSuite)
-	}
-	if doc.Proof.VerificationMethod == nil {
-		t.Fatal("verification method is nil")
-	}
-	if got := doc.Proof.VerificationMethod.String(); got != "did:web:example.com:user:101#key-1" {
-		t.Errorf("verification method = %s", got)
-	}
-	if len(doc.Proof.ProofValue) == 0 {
-		t.Error("proof value is empty")
-	}
-}
-
-// Sign must refuse to produce a doc that ParseDoc would reject.
-func TestSign_RejectsInvalidProofConfig(t *testing.T) {
-	tests := []struct {
-		name   string
-		mutate func(*Proof)
-		want   string
-	}{
-		{name: "wrong type", mutate: func(p *Proof) { p.ProofType = "Ed25519Signature2020" }, want: "Unsupported proof type: Ed25519Signature2020"},
-		{name: "empty type", mutate: func(p *Proof) { p.ProofType = "" }, want: "Unsupported proof type: "},
-		{name: "wrong purpose", mutate: func(p *Proof) { p.ProofPurpose = "authentication" }, want: "Unsupported proof purpose: authentication"},
-		{name: "empty purpose", mutate: func(p *Proof) { p.ProofPurpose = "" }, want: "Unsupported proof purpose: "},
-		{name: "no verification method", mutate: func(p *Proof) { p.VerificationMethod = nil }, want: "Proof has no verificationMethod"},
-	}
 	signer := mustECDSASigner(t)
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuite_ECDSA_JCS_2019)
-			tt.mutate(&vd.Proof)
-			requireSignError(t, &vd, signer, tt.want)
-		})
-	}
+	vd := mustMakeVerifiableDoc(t, doc, CryptoSuiteECDSAJCS2019)
+	vd.Proof.Created = created
+	vd.Proof.Expires = expires
+	return mustParseDoc(t, mustSign(t, &vd, signer)), signer.verifier()
 }
 
-func docWithProof(proof string) string {
-	return `{"id":"urn:example:1","proof":` + proof + `}`
+func requireParseDocError(t *testing.T, doc string, want string) {
+	t.Helper()
+	_, err := ParseDoc([]byte(doc))
+	requireErrorContains(t, err, want)
+}
+
+func requireSignError(t *testing.T, vd *VerifiableDoc, signer Signer, want string) {
+	t.Helper()
+	signed, err := vd.Sign(signer)
+	requireErrorContains(t, err, want)
+	if signed != nil {
+		t.Errorf("Sign returned %s with an error", signed)
+	}
 }
 
 // validProofFields returns the fields of a proof that ParseDoc accepts.
@@ -780,345 +95,405 @@ func validProofFields() map[string]any {
 		"type":               "DataIntegrityProof",
 		"proofPurpose":       "assertionMethod",
 		"cryptosuite":        "ecdsa-jcs-2019",
-		"verificationMethod": "did:web:example.com:user:101#key-1",
-		"proofValue":         "z1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+		"verificationMethod": testKeyURL,
+		"proofValue":         exampleProofValueEncoded,
 	}
 }
 
-func proofJSON(t *testing.T, fields map[string]any) string {
+// docWithProof returns a small document with the given proof fields.
+func docWithProof(t *testing.T, proof map[string]any) string {
 	t.Helper()
-	proof, err := json.Marshal(fields)
-	if err != nil {
-		t.Fatalf("marshal proof: %v", err)
-	}
-	return string(proof)
+	return string(mustMarshal(t, map[string]any{"id": "urn:example:1", "proof": proof}))
 }
 
-func requireParseDocError(t *testing.T, document, want string) {
+// signedFields splits a signed document into its top-level fields and its
+// proof's fields, as raw JSON.
+func signedFields(t *testing.T, signed []byte) (document, proof map[string]json.RawMessage) {
 	t.Helper()
-	_, err := ParseDoc([]byte(document))
-	if err == nil {
-		t.Fatal("ParseDoc succeeded")
-	}
-	if !strings.Contains(err.Error(), want) {
-		t.Fatalf("error = %q, want substring %q", err, want)
+	mustUnmarshal(t, signed, &document)
+	mustUnmarshal(t, document["proof"], &proof)
+	return document, proof
+}
+
+// requireRawField checks a raw JSON field. An empty want means the field must be absent.
+func requireRawField(t *testing.T, fields map[string]json.RawMessage, name, want string) {
+	t.Helper()
+	got, ok := fields[name]
+	switch {
+	case want == "" && ok:
+		t.Errorf("%s = %s, want it absent", name, got)
+	case want != "" && !ok:
+		t.Errorf("%s is absent, want %s", name, want)
+	case want != "" && string(got) != want:
+		t.Errorf("%s = %s, want %s", name, got, want)
 	}
 }
 
-func TestVerifDocVerify(t *testing.T) {
-	doc, err := ParseDoc([]byte(exFullCredential))
-	if err != nil {
-		t.Errorf("Error parsing verif doc: %s", err)
-		return
-	}
-
-	// in practice would check verificationMethod ID and retrieve,
-	// but for test just assume we have the correct key.
-
-	expHash := "fe5799489119c7fe3c528715e72bd39d2ec6b4ab345978df32e9a9312648ec2559b7cb6251b8991add1ce0bc83107e3db9dbbab5bd2c28f687db1a03abc92f19"
-	docHash, err := doc.GetHash(sha256hash)
-	if err != nil {
-		t.Errorf("Error hashing doc: %s", err)
-	} else if hex.EncodeToString(docHash) != expHash {
-		t.Errorf("Doc hash does not match expected.\nGot: %s\nExp: %s", hex.EncodeToString(docHash), expHash)
-	}
-
-	const key = "zDnaepBuvsQ8cpsWrVKw8fbpGpvPeNSjVPTWoq6cRqaYzBKVP"
-	verifier, err := VerifierFromMultikey(key)
-	if err != nil {
-		t.Errorf("Error getting verif key: %s", err)
-	}
-	if key != doc.Proof.VerificationMethod.ID {
-		t.Errorf("Verif key does not match expected.\nGot: %s\nExp: %s", doc.Proof.VerificationMethod.ID, key)
-	}
-	result, err := doc.Verify(verifier)
-	if err != nil {
-		t.Errorf("Error verifying doc: %s", err)
-	} else if !result {
-		t.Errorf("Doc verification failed.")
-	}
+// stubSigner stands in for signature types this package cannot generate,
+// and for a sign call that fails on its own.
+type stubSigner struct {
+	kind    SigType
+	signErr error
 }
 
-// Helper to print out a sample doc and matching DID.
-func MakeDocWithDID(t *testing.T) {
-	// First make a DID and DID doc
-	const didIDString = "did:web:example.com:user:101"
-	didID, err := did.ParseDID(didIDString)
-	if err != nil {
-		t.Fatalf("Could not parse DID path: %s", err)
+func (s stubSigner) sign([]byte) ([]byte, error) {
+	if s.signErr != nil {
+		return nil, s.signErr
 	}
-
-	didDoc := &did.Document{
-		Context: []interface{}{did.DIDContextV1URI()},
-		ID:      *didID,
-	}
-	didKeyPath := didIDString + "#key-1"
-	didKeyURL, _ := did.ParseDIDURL(didKeyPath)
-	signKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	verificationMethod, err := did.NewVerificationMethod(*didKeyURL, ssi.JsonWebKey2020, did.DID{}, signKey.Public())
-	didDoc.AddAssertionMethod(verificationMethod)
-	didJson, _ := json.MarshalIndent(didDoc, "", "  ")
-	fmt.Printf("Sample DID: %s\n", didID.String())
-	keyBytes, _ := signKey.Bytes()
-	fmt.Printf("Signing key: %s\n", hex.EncodeToString(keyBytes))
-	fmt.Println("Sample DID Doc:")
-	fmt.Println(string(didJson))
-
-	baseDoc := struct {
-		ID   int    `json:"id"`
-		Name string `json:"name"`
-	}{
-		ID:   101,
-		Name: "Alice",
-	}
-	vd, err := MakeVerifiableDoc(baseDoc, CryptoSuite_ECDSA_JCS_2019, didKeyURL)
-	if err != nil {
-		t.Fatalf("Error making verifiable doc: %s", err)
-	}
-	signer := ECDSASigner{
-		signKey: *signKey,
-	}
-	signedDoc, err := vd.Sign(signer)
-	if err != nil {
-		t.Fatalf("Error signing verifiable doc: %s", err)
-	}
-	fmt.Println("Signed doc:")
-	fmt.Println(string(signedDoc))
-	// t.Error("blah")
+	return []byte{0x01}, nil
 }
 
-func TestVerifyDocFromDID(t *testing.T) {
-	// This doc was signed by an earlier version that wrote a local-time created
-	// and a zero "expiry" field. Neither is standard, but both are covered by the
-	// signature, so it must still verify.
-	const sampleDocStr = `{"id":101,"name":"Alice","proof":{"type":"DataIntegrityProof","proofPurpose":"assertionMethod","cryptosuite":"ecdsa-jcs-2019","verificationMethod":"did:web:example.com:user:101#key-1","proofValue":"z41BkGy5VEDeqrKqFwea5br1gmaZKT9YESoCVz2ESsvoFScazx6Le8VytRisoKjkzD63aF8DH38U74sjaBLu7CMzF","created":"2026-10-06T15:06:41.070247+08:00","expiry":"0001-01-01T00:00:00Z"}}`
-	const didDocStr = `{
-  "@context": "https://www.w3.org/ns/did/v1",
-  "assertionMethod": [
-    "did:web:example.com:user:101#key-1"
-  ],
-  "id": "did:web:example.com:user:101",
-  "verificationMethod": [
-    {
-      "controller": "did:web:example.com:user:101",
-      "id": "did:web:example.com:user:101#key-1",
-      "publicKeyJwk": {
-        "crv": "P-256",
-        "kty": "EC",
-        "x": "og9qNE10V4aSHCTMJFCAcciUfbUqk_pe4MXlqVqEEow",
-        "y": "NirPmr7CcLI6GVlNNCvOrA7YKfnj40VT8bEKMZ591QU"
-      },
-      "type": "JsonWebKey2020"
-    }
-  ]
-}`
+func (s stubSigner) sigType() SigType        { return s.kind }
+func (s stubSigner) hash(data []byte) []byte { return data }
+func (s stubSigner) verifier() SigVerifier   { return nil }
 
-	vd, err := ParseDoc([]byte(sampleDocStr))
-	if err != nil {
-		t.Fatalf("Error parsing doc: %s", err)
-	}
+// refuseJSON is a document whose MarshalJSON method fails.
+type refuseJSON struct{}
 
-	// At this point we'd go and fetch the DID
-	didDoc, err := did.ParseDocument(didDocStr)
-	if err != nil {
-		t.Fatalf("Error parsing did doc: %s", err)
-	}
-	if vd.Proof.VerificationMethod.DID != didDoc.ID {
-		t.Errorf("Proof DID does not match DID Doc, proof DID = %s, doc DID = %s", vd.Proof.VerificationMethod.DID.String(), didDoc.ID.String())
-	}
+func (refuseJSON) MarshalJSON() ([]byte, error) { return nil, errors.New("refuse to marshal") }
 
-	// Get a verifier for the assertion key the proof names.
-	keyURL := vd.Proof.VerificationMethod
-	verifier, err := GetAssertionVerifier(didDoc, keyURL)
-	if err != nil {
-		t.Fatalf("Error getting verifier: %s\nKey URL: %s", err, keyURL)
-	}
+// --- CryptoSuiteType ---
 
-	// Now verify the doc.
-	b, err := vd.Verify(verifier)
-	if err != nil {
-		t.Fatalf("Error verifying doc: %s", err)
-	}
-	if !b {
-		t.Error("Doc failed to verify.")
-	}
-}
-
-func TestMakeVerifDoc(t *testing.T) {
-	baseDoc := struct {
-		ID   int    `json:"id"`
-		Name string `json:"name"`
-	}{
-		ID:   101,
-		Name: "Alice",
-	}
-	const didString = "did:web:example.com:user:101#key-1"
-	didUrl := did.MustParseDIDURL(didString)
-	vd, err := MakeVerifiableDoc(baseDoc, CryptoSuite_ECDSA_JCS_2019, &didUrl)
-	if err != nil {
-		t.Fatalf("Error making verifiable doc: %s", err)
-	}
-	if vd.Proof.ProofType != "DataIntegrityProof" {
-		t.Errorf("Proof type does not match expected, got %s, want %s", vd.Proof.ProofType, "DataIntegrityProof")
-	}
-	if vd.Proof.ProofPurpose != "assertionMethod" {
-		t.Errorf("Proof purpose does not match expected, got %s, want %s", vd.Proof.ProofPurpose, "assertionMethod")
-	}
-	if vd.Proof.CryptoSuite != CryptoSuite_ECDSA_JCS_2019 {
-		t.Errorf("Crypto suite does not match expected, got %s, want %s", vd.Proof.CryptoSuite, "CryptoSuite_ECDSA_JCS_2019")
-	}
-	if vd.Proof.VerificationMethod.String() != didString {
-		t.Errorf("Verification method does not match expected, got %s, want %s", vd.Proof.VerificationMethod, didString)
-	}
-	expBodyJCS, _ := jcs.Transform([]byte(`{"id":101,"name": "Alice"}`))
-	resBodyJCS, _ := jcs.Transform(vd.Body)
-	if string(resBodyJCS) != string(expBodyJCS) {
-		t.Errorf("Body doe not match expected.\nGot: %s\nExp: %s", string(resBodyJCS), string(expBodyJCS))
-	}
-}
-
-func TestSignVerifDoc(t *testing.T) {
-	baseDoc := struct {
-		ID   int    `json:"id"`
-		Name string `json:"name"`
-	}{
-		ID:   101,
-		Name: "Alice",
-	}
-	const didString = "did:web:example.com:user:101#key-1"
-	didUrl := did.MustParseDIDURL(didString)
-	vd, err := MakeVerifiableDoc(baseDoc, CryptoSuite_ECDSA_JCS_2019, &didUrl)
-	if err != nil {
-		t.Fatalf("Error making verifiable doc: %s", err)
-	}
-	signer, err := GenerateECDSASigner(elliptic.P256())
-	if err != nil {
-		t.Fatalf("Error generating ECDSA signer: %s", err)
-	}
-	signedDoc, err := vd.Sign(signer)
-	if err != nil {
-		t.Fatalf("Error signing verifiable doc: %s", err)
-	}
-
-	vd2, err := ParseDoc(signedDoc)
-	if err != nil {
-		t.Fatalf("Error parsing signed doc: %s", err)
-	}
-	b, err := vd2.Verify(signer.verifier())
-	if err != nil {
-		t.Errorf("Error verifying signed doc: %s", err)
-	}
-	if !b {
-		t.Error("Signed doc failed to verify.")
-	}
-}
-
-// Data Integrity timestamps are XML Schema dateTimeStamp values. Make writes
-// them in UTC with whole seconds so every implementation reads them the same.
-var wholeSecondUTC = regexp.MustCompile(`^"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"$`)
-
-func TestMakeVerifiableDoc_CreatedIsUTCWholeSeconds(t *testing.T) {
-	before := time.Now().Truncate(time.Second)
-	vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuite_ECDSA_JCS_2019)
-	after := time.Now()
-
-	created := vd.Proof.Created
-	if created.Location() != time.UTC {
-		t.Errorf("created location = %s, want UTC", created.Location())
-	}
-	if created.Nanosecond() != 0 {
-		t.Errorf("created = %s, want whole seconds", created.Format(time.RFC3339Nano))
-	}
-	if created.Before(before) || created.After(after) {
-		t.Errorf("created = %s, want between %s and %s", created, before, after)
-	}
-	if !vd.Proof.Expires.IsZero() {
-		t.Errorf("expires = %s, want unset", vd.Proof.Expires)
-	}
-}
-
-func TestSign_ProofTimestamps(t *testing.T) {
-	created := time.Date(2026, 3, 28, 15, 40, 0, 0, time.UTC)
-	expires := created.Add(24 * time.Hour)
+func TestCryptoSuiteType_Names(t *testing.T) {
 	tests := []struct {
-		name        string
-		created     time.Time
-		expires     time.Time
-		wantCreated string // empty means the field must be absent
-		wantExpires string // empty means the field must be absent
+		suite CryptoSuiteType
+		name  string
 	}{
-		{
-			name:        "created only",
-			created:     created,
-			wantCreated: `"2026-03-28T15:40:00Z"`,
-		},
-		{
-			name:        "created and expires",
-			created:     created,
-			expires:     expires,
-			wantCreated: `"2026-03-28T15:40:00Z"`,
-			wantExpires: `"2026-03-29T15:40:00Z"`,
-		},
-		{
-			name: "neither",
-		},
+		{CryptoSuiteECDSAJCS2019, "ecdsa-jcs-2019"},
+		{CryptoSuiteECDSARDFC2019, "ecdsa-rdfc-2019"},
+		{CryptoSuiteEDDSAJCS2022, "eddsa-jcs-2022"},
+		{CryptoSuiteEDDSARDFC2022, "eddsa-rdfc-2022"},
 	}
-	signer := mustECDSASigner(t)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuite_ECDSA_JCS_2019)
-			vd.Proof.Created = tt.created
-			vd.Proof.Expires = tt.expires
-			signed, err := vd.Sign(signer)
-			if err != nil {
-				t.Fatalf("Sign: %v", err)
+			if got := tt.suite.String(); got != tt.name {
+				t.Errorf("String() = %q, want %q", got, tt.name)
 			}
-
-			proof := signedProofFields(t, signed)
-			if _, ok := proof["expiry"]; ok {
-				t.Errorf("proof has non-standard expiry field: %s", proof["expiry"])
+			if got := ParseCryptoSuite(tt.name); got != tt.suite {
+				t.Errorf("ParseCryptoSuite(%q) = %v, want %v", tt.name, got, tt.suite)
 			}
-			requireRawField(t, proof, "created", tt.wantCreated)
-			requireRawField(t, proof, "expires", tt.wantExpires)
-
-			parsed, err := ParseDoc(signed)
-			if err != nil {
-				t.Fatalf("ParseDoc: %v", err)
+			var parsed CryptoSuiteType
+			if err := parsed.UnmarshalText([]byte(tt.name)); err != nil {
+				t.Fatalf("UnmarshalText: %v", err)
 			}
-			if !parsed.Proof.Created.Equal(tt.created) {
-				t.Errorf("parsed created = %s, want %s", parsed.Proof.Created, tt.created)
-			}
-			if !parsed.Proof.Expires.Equal(tt.expires) {
-				t.Errorf("parsed expires = %s, want %s", parsed.Proof.Expires, tt.expires)
-			}
-			ok, err := parsed.Verify(signer.verifier())
-			if err != nil {
-				t.Fatalf("Verify: %v", err)
-			}
-			if !ok {
-				t.Fatal("Verify returned false")
+			if parsed != tt.suite {
+				t.Errorf("UnmarshalText(%q) = %v, want %v", tt.name, parsed, tt.suite)
 			}
 		})
 	}
 }
 
-// A freshly made and signed doc writes created as whole-second UTC and leaves
-// expires out.
-func TestSign_DefaultTimestampFormat(t *testing.T) {
-	vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuite_ECDSA_JCS_2019)
-	signed, err := vd.Sign(mustECDSASigner(t))
-	if err != nil {
-		t.Fatalf("Sign: %v", err)
+func TestCryptoSuiteType_UnknownName(t *testing.T) {
+	const name = "not-a-suite"
+	if got := ParseCryptoSuite(name); got != CryptoSuiteUnknown {
+		t.Errorf("ParseCryptoSuite(%q) = %v, want %v", name, got, CryptoSuiteUnknown)
 	}
-	proof := signedProofFields(t, signed)
-	if got := string(proof["created"]); !wholeSecondUTC.MatchString(got) {
-		t.Errorf("created = %s, want whole-second UTC like \"2026-03-28T15:40:00Z\"", got)
+	suite := CryptoSuiteECDSAJCS2019
+	requireErrorContains(t, suite.UnmarshalText([]byte(name)), name)
+	if suite != CryptoSuiteECDSAJCS2019 {
+		t.Errorf("suite = %v after a failed UnmarshalText, want it unchanged", suite)
 	}
-	for _, field := range []string{"expires", "expiry"} {
-		if got, ok := proof[field]; ok {
-			t.Errorf("proof has %s = %s, want it absent", field, got)
+}
+
+// Marshalling an unknown suite must fail, rather than write a name that
+// unmarshalling would then reject. CryptoSuiteType is an int, so any value
+// outside the declared constants is unknown too.
+func TestCryptoSuiteType_MarshalUnknown(t *testing.T) {
+	tests := []struct {
+		name  string
+		suite CryptoSuiteType
+	}{
+		{name: "unknown constant", suite: CryptoSuiteUnknown},
+		{name: "past the last constant", suite: CryptoSuiteEDDSARDFC2022 + 1},
+		{name: "negative", suite: CryptoSuiteType(-1)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if text, err := tt.suite.MarshalText(); err == nil {
+				t.Errorf("MarshalText = %q, want an error", text)
+			}
+			if out, err := json.Marshal(Proof{CryptoSuite: tt.suite}); err == nil {
+				t.Errorf("json.Marshal = %s, want an error", out)
+			}
+			if got := tt.suite.String(); got != "unknown crypto suite" {
+				t.Errorf("String() = %q, want %q", got, "unknown crypto suite")
+			}
+			if tt.suite.MatchesSigType(SigTypeECDSA) || tt.suite.MatchesSigType(SigTypeEDDSA) {
+				t.Error("unknown suite matches a signature type")
+			}
+		})
+	}
+}
+
+// --- W3C vectors ---
+
+func TestW3CVectors_HashData(t *testing.T) {
+	for _, vec := range w3cVectors {
+		t.Run(vec.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := vectorDoc(t, vec).hashData(mustVerifier(t, vec.publicKey).hash)
+			if err != nil {
+				t.Fatalf("hashData: %v", err)
+			}
+			if hex.EncodeToString(got) != vec.hashData {
+				t.Errorf("hashData = %x, want %s", got, vec.hashData)
+			}
+		})
+	}
+}
+
+func TestW3CVectors_Verify(t *testing.T) {
+	for _, vec := range w3cVectors {
+		t.Run(vec.name, func(t *testing.T) {
+			t.Parallel()
+			vd := vectorDoc(t, vec)
+			if got := hex.EncodeToString(vd.Proof.ProofValue); got != vec.signature {
+				t.Errorf("proofValue = %s, want %s", got, vec.signature)
+			}
+			requireNoError(t, vd.Verify(mustVerifier(t, vec.publicKey)))
+		})
+	}
+}
+
+func TestW3CVectors_RejectTampering(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *VerifiableDoc)
+	}{
+		{
+			name: "body",
+			mutate: func(t *testing.T, vd *VerifiableDoc) {
+				vd.Body = replaceOnce(t, vd.Body, `"Alumni Credential"`, `"Tampered"`)
+			},
+		},
+		{
+			name: "proof options",
+			mutate: func(t *testing.T, vd *VerifiableDoc) {
+				vd.rawProofOptions = replaceOnce(t, vd.rawProofOptions, "2023-02-24", "2023-02-25")
+			},
+		},
+		{
+			name: "signature",
+			mutate: func(_ *testing.T, vd *VerifiableDoc) {
+				vd.Proof.ProofValue = flipBit(vd.Proof.ProofValue, 0)
+			},
+		},
+		{
+			name: "signature length",
+			mutate: func(_ *testing.T, vd *VerifiableDoc) {
+				vd.Proof.ProofValue = vd.Proof.ProofValue[:len(vd.Proof.ProofValue)-1]
+			},
+		},
+	}
+	for _, vec := range w3cVectors {
+		for _, tt := range tests {
+			t.Run(vec.name+"/"+tt.name, func(t *testing.T) {
+				t.Parallel()
+				vd := vectorDoc(t, vec)
+				tt.mutate(t, &vd)
+				requireErrorIs(t, vd.Verify(mustVerifier(t, vec.publicKey)), ErrInvalidSignature)
+			})
 		}
+	}
+}
+
+// replaceOnce replaces the first old in b with new, failing the test if b
+// does not contain old.
+func replaceOnce(t *testing.T, b []byte, old, new string) []byte {
+	t.Helper()
+	if !bytes.Contains(b, []byte(old)) {
+		t.Fatalf("test setup: %s does not contain %s", b, old)
+	}
+	return bytes.Replace(b, []byte(old), []byte(new), 1)
+}
+
+// The W3C vectors carry an @context in their proofs, as the JCS cryptosuite
+// specifications require. This package does not accept that.
+func TestW3CVectors_ParseDocRejectsProofContext(t *testing.T) {
+	for _, vec := range w3cVectors {
+		t.Run(vec.name, func(t *testing.T) {
+			t.Parallel()
+			requireParseDocError(t, vec.signed(), "proof must not have an @context")
+		})
+	}
+}
+
+// --- ParseDoc ---
+
+// rdfcExampleDoc uses eddsa-rdfc-2022, which ParseDoc accepts but this
+// package cannot hash. Its proof has a field, "habla", that Proof does not model.
+const rdfcExampleDoc = `{
+  "@context": [
+    "https://www.w3.org/ns/activitystreams",
+    "https://w3id.org/security/data-integrity/v2"
+  ],
+  "id": "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jFuXzM2yZjnjJa3321",
+  "type": "Person",
+  "name": "Alice",
+  "proof": {
+    "type": "DataIntegrityProof",
+    "cryptosuite": "eddsa-rdfc-2022",
+    "created": "2026-03-28T15:40:00Z",
+    "verificationMethod": "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jFuXzM2yZjnjJa3321#z6MkpTHR8VNsBxYAAWHut2Geadd9jFuXzM2yZjnjJa3321",
+    "proofPurpose": "assertionMethod",
+    "proofValue": "z1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+    "habla": "blah"
+  }
+}`
+
+func TestParseDoc(t *testing.T) {
+	vd := mustParseDoc(t, []byte(rdfcExampleDoc))
+
+	p := vd.Proof
+	if p.ProofType != "DataIntegrityProof" || p.ProofPurpose != "assertionMethod" {
+		t.Errorf("type, purpose = %q, %q", p.ProofType, p.ProofPurpose)
+	}
+	if p.CryptoSuite != CryptoSuiteEDDSARDFC2022 {
+		t.Errorf("cryptosuite = %v, want %v", p.CryptoSuite, CryptoSuiteEDDSARDFC2022)
+	}
+	const wantVM = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jFuXzM2yZjnjJa3321#z6MkpTHR8VNsBxYAAWHut2Geadd9jFuXzM2yZjnjJa3321"
+	if got := p.VerificationMethod.String(); got != wantVM {
+		t.Errorf("verificationMethod = %s, want %s", got, wantVM)
+	}
+	if !bytes.Equal(p.ProofValue, exampleProofValue) {
+		t.Errorf("proofValue = %x, want %x", p.ProofValue, exampleProofValue)
+	}
+	if want := time.Date(2026, 3, 28, 15, 40, 0, 0, time.UTC); !p.Created.Equal(want) {
+		t.Errorf("created = %s, want %s", p.Created, want)
+	}
+
+	var body map[string]json.RawMessage
+	mustUnmarshal(t, vd.Body, &body)
+	requireRawField(t, body, "proof", "")
+	requireRawField(t, body, "name", `"Alice"`)
+
+	// The proof options keep fields that Proof does not model, so they are
+	// still covered by the signature.
+	var options map[string]json.RawMessage
+	mustUnmarshal(t, vd.rawProofOptions, &options)
+	requireRawField(t, options, "habla", `"blah"`)
+	requireRawField(t, options, "proofValue", "")
+}
+
+// ParseDoc only decodes the top-level object, so other fields are kept as
+// they are, even a string that looks like broken JSON.
+func TestParseDoc_KeepsOtherFieldsRaw(t *testing.T) {
+	doc := mustMarshal(t, map[string]any{
+		"id":                "urn:example:1",
+		"credentialSubject": "{not: valid}",
+		"proof":             validProofFields(),
+	})
+	var body map[string]json.RawMessage
+	mustUnmarshal(t, mustParseDoc(t, doc).Body, &body)
+	requireRawField(t, body, "credentialSubject", `"{not: valid}"`)
+}
+
+func TestParseDoc_RejectsMalformed(t *testing.T) {
+	proof := string(mustMarshal(t, validProofFields()))
+	withProofField := func(name, value string) string {
+		fields := validProofFields()
+		fields[name] = value
+		return docWithProof(t, fields)
+	}
+	tests := []struct {
+		name string
+		doc  string
+		want string
+	}{
+		{name: "not JSON", doc: `{"id":`, want: "parsing document"},
+		{name: "not an object", doc: `[1, 2, 3]`, want: "parsing document"},
+		{name: "no proof", doc: `{"id":"urn:example:1"}`, want: "document has no proof"},
+		{name: "proof is an array", doc: `{"id":"urn:example:1","proof":[1, 2, 3]}`, want: "parsing proof"},
+		{name: "unknown cryptosuite", doc: withProofField("cryptosuite", "nope"), want: "parsing proof"},
+		{name: "bad created", doc: withProofField("created", "yesterday"), want: "parsing proof"},
+		{name: "bad proofValue", doc: withProofField("proofValue", "not-valid"), want: "parsing proof"},
+		// encoding/json keeps the last of two duplicate keys, while other
+		// parsers may keep the first, so duplicates are rejected.
+		{name: "duplicate top-level key", doc: `{"name":"Alice","name":"Mallory","proof":` + proof + `}`, want: "Duplicate key"},
+		{name: "two proofs", doc: `{"name":"Alice","proof":` + proof + `,"proof":` + proof + `}`, want: "Duplicate key"},
+		{name: "duplicate key in proof", doc: `{"name":"Alice","proof":{"type":"Other",` + proof[1:] + `}`, want: "Duplicate key"},
+		{name: "duplicate nested key", doc: `{"subject":{"name":"Alice","name":"Mallory"},"proof":` + proof + `}`, want: "Duplicate key"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			requireParseDocError(t, tt.doc, tt.want)
+		})
+	}
+}
+
+// The @context belongs on the document only, so any @context on the proof
+// is rejected, even an empty or null one.
+func TestParseDoc_RejectsProofContext(t *testing.T) {
+	tests := []struct {
+		name    string
+		context any
+	}{
+		{name: "array", context: []any{"https://www.w3.org/ns/credentials/v2"}},
+		{name: "string", context: DataIntegrityContext},
+		{name: "empty array", context: []any{}},
+		{name: "null", context: nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fields := validProofFields()
+			fields["@context"] = tt.context
+			requireParseDocError(t, docWithProof(t, fields), "proof must not have an @context")
+		})
+	}
+}
+
+// ParseDoc requires every field that a Data Integrity proof must carry.
+// A value that is present but empty or null counts as missing.
+func TestParseDoc_MissingProofFields(t *testing.T) {
+	tests := []struct {
+		name  string
+		field string
+		value any // used instead of removing the field when not nil
+		want  string
+	}{
+		{name: "no type", field: "type", want: `unsupported proof type ""`},
+		{name: "empty type", field: "type", value: "", want: `unsupported proof type ""`},
+		{name: "no purpose", field: "proofPurpose", want: `unsupported proof purpose ""`},
+		{name: "empty purpose", field: "proofPurpose", value: "", want: `unsupported proof purpose ""`},
+		{name: "no cryptosuite", field: "cryptosuite", want: "proof has no cryptosuite"},
+		{name: "no verification method", field: "verificationMethod", want: "proof has no verificationMethod"},
+		{name: "null verification method", field: "verificationMethod", value: json.RawMessage("null"), want: "proof has no verificationMethod"},
+		{name: "no proof value", field: "proofValue", want: "proof has no proofValue"},
+		{name: "null proof value", field: "proofValue", value: json.RawMessage("null"), want: "proof has no proofValue"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fields := validProofFields()
+			delete(fields, tt.field)
+			if tt.value != nil {
+				fields[tt.field] = tt.value
+			}
+			requireParseDocError(t, docWithProof(t, fields), tt.want)
+		})
+	}
+}
+
+func TestParseDoc_WrongTypeOrPurpose(t *testing.T) {
+	tests := []struct {
+		field string
+		value string
+		want  string
+	}{
+		{field: "type", value: "Ed25519Signature2020", want: `unsupported proof type "Ed25519Signature2020"`},
+		{field: "proofPurpose", value: "authentication", want: `unsupported proof purpose "authentication"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.field, func(t *testing.T) {
+			t.Parallel()
+			fields := validProofFields()
+			fields[tt.field] = tt.value
+			requireParseDocError(t, docWithProof(t, fields), tt.want)
+		})
 	}
 }
 
@@ -1140,58 +515,72 @@ func TestParseDoc_ProofTimestamps(t *testing.T) {
 			times:       map[string]any{"created": "2026-10-06T15:06:41.070247+08:00"},
 			wantCreated: time.Date(2026, 10, 6, 7, 6, 41, 70247000, time.UTC),
 		},
-		{
-			name: "absent",
-		},
+		{name: "absent"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			fields := validProofFields()
 			maps.Copy(fields, tt.times)
-			doc := mustParseCredential(t, docWithProof(proofJSON(t, fields)))
-			if !doc.Proof.Created.Equal(tt.wantCreated) {
-				t.Errorf("created = %s, want %s", doc.Proof.Created, tt.wantCreated)
+			p := mustParseDoc(t, []byte(docWithProof(t, fields))).Proof
+			if !p.Created.Equal(tt.wantCreated) {
+				t.Errorf("created = %s, want %s", p.Created, tt.wantCreated)
 			}
-			if !doc.Proof.Expires.Equal(tt.wantExpires) {
-				t.Errorf("expires = %s, want %s", doc.Proof.Expires, tt.wantExpires)
+			if !p.Expires.Equal(tt.wantExpires) {
+				t.Errorf("expires = %s, want %s", p.Expires, tt.wantExpires)
 			}
 		})
 	}
 }
 
-func signedProofFields(t *testing.T, signed []byte) map[string]json.RawMessage {
-	t.Helper()
-	var doc struct {
-		Proof map[string]json.RawMessage `json:"proof"`
-	}
-	if err := json.Unmarshal(signed, &doc); err != nil {
-		t.Fatalf("unmarshal signed doc: %v", err)
-	}
-	if doc.Proof == nil {
-		t.Fatalf("signed doc has no proof: %s", signed)
-	}
-	return doc.Proof
-}
-
-// requireRawField checks a raw JSON field. An empty want means the field must be absent.
-func requireRawField(t *testing.T, fields map[string]json.RawMessage, name, want string) {
-	t.Helper()
-	got, ok := fields[name]
-	switch {
-	case want == "" && ok:
-		t.Errorf("%s = %s, want it absent", name, got)
-	case want != "" && !ok:
-		t.Errorf("%s is absent, want %s", name, want)
-	case want != "" && string(got) != want:
-		t.Errorf("%s = %s, want %s", name, got, want)
+// A proof that expires at or before it was created can never be valid.
+func TestParseDoc_ExpiresNotAfterCreated(t *testing.T) {
+	for _, expires := range []string{"2026-03-28T15:40:00Z", "2026-03-28T15:39:59Z"} {
+		t.Run(expires, func(t *testing.T) {
+			t.Parallel()
+			fields := validProofFields()
+			fields["created"] = "2026-03-28T15:40:00Z"
+			fields["expires"] = expires
+			requireParseDocError(t, docWithProof(t, fields), "proof expires at or before it was created")
+		})
 	}
 }
 
-// Make's only error is json.Marshal of the document. These are the values
-// that call can refuse: unsupported types, non-finite floats, cycles,
-// a MarshalJSON method that returns an error, and raw JSON that is not valid.
-func TestMake_RejectsUnmarshalableDoc(t *testing.T) {
+// --- MakeVerifiableDoc ---
+
+func TestMakeVerifiableDoc(t *testing.T) {
+	before := time.Now().Truncate(time.Second)
+	vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
+	after := time.Now()
+
+	p := vd.Proof
+	if p.ProofType != "DataIntegrityProof" || p.ProofPurpose != "assertionMethod" {
+		t.Errorf("type, purpose = %q, %q", p.ProofType, p.ProofPurpose)
+	}
+	if p.CryptoSuite != CryptoSuiteECDSAJCS2019 {
+		t.Errorf("cryptosuite = %v, want %v", p.CryptoSuite, CryptoSuiteECDSAJCS2019)
+	}
+	if got := p.VerificationMethod.String(); got != testKeyURL {
+		t.Errorf("verificationMethod = %s, want %s", got, testKeyURL)
+	}
+	if got, want := string(vd.Body), `{"id":101,"name":"Alice"}`; got != want {
+		t.Errorf("body = %s, want %s", got, want)
+	}
+
+	// created is now, in UTC, with whole seconds.
+	if p.Created.Location() != time.UTC || p.Created.Nanosecond() != 0 {
+		t.Errorf("created = %s, want UTC with whole seconds", p.Created.Format(time.RFC3339Nano))
+	}
+	if p.Created.Before(before) || p.Created.After(after) {
+		t.Errorf("created = %s, want between %s and %s", p.Created, before, after)
+	}
+	if !p.Expires.IsZero() {
+		t.Errorf("expires = %s, want unset", p.Expires)
+	}
+}
+
+// MakeVerifiableDoc's only error is from json.Marshal of the document.
+func TestMakeVerifiableDoc_RejectsUnmarshalableDoc(t *testing.T) {
 	type cycle struct {
 		Self *cycle `json:"self"`
 	}
@@ -1209,66 +598,172 @@ func TestMake_RejectsUnmarshalableDoc(t *testing.T) {
 		{name: "map key", doc: map[struct{ N int }]string{{}: "x"}, want: "object member name must be a string"},
 		{name: "NaN", doc: math.NaN(), want: "unsupported value: NaN"},
 		{name: "+Inf", doc: math.Inf(1), want: "unsupported value: +Inf"},
-		{name: "-Inf", doc: math.Inf(-1), want: "unsupported value: -Inf"},
 		{name: "cycle", doc: loop, want: "encountered a cycle"},
 		{name: "marshal error", doc: refuseJSON{}, want: "refuse to marshal"},
-		{name: "truncated raw json", doc: json.RawMessage(`{"id":`), want: "unexpected end of JSON input"},
-		{name: "trailing junk", doc: json.RawMessage(`{"id":1}x`), want: "invalid character"},
+		{name: "invalid raw JSON", doc: json.RawMessage(`{"id":`), want: "unexpected end of JSON input"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			requireMakeError(t, tt.doc, tt.want)
+			vm := did.MustParseDIDURL(testKeyURL)
+			vd, err := MakeVerifiableDoc(tt.doc, CryptoSuiteECDSAJCS2019, &vm)
+			requireErrorContains(t, err, tt.want)
+			if vd.Body != nil || vd.Proof.ProofType != "" {
+				t.Errorf("MakeVerifiableDoc returned a partial doc with its error: %+v", vd)
+			}
 		})
 	}
+}
+
+// --- Sign ---
+
+func TestSign_RoundTrip(t *testing.T) {
+	for _, curve := range []elliptic.Curve{elliptic.P256(), elliptic.P384(), elliptic.P521()} {
+		t.Run(curve.Params().Name, func(t *testing.T) {
+			t.Parallel()
+			signer, err := GenerateECDSASigner(curve)
+			if err != nil {
+				t.Fatalf("GenerateECDSASigner: %v", err)
+			}
+			vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
+			parsed := mustParseDoc(t, mustSign(t, &vd, signer))
+			requireNoError(t, parsed.Verify(signer.verifier()))
+		})
+	}
+}
+
+// After a successful Sign, the doc holds the new proof and verifies as is.
+func TestSign_UpdatesDoc(t *testing.T) {
+	signer := mustECDSASigner(t)
+	vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
+	signed := mustSign(t, &vd, signer)
+
+	if len(vd.Proof.ProofValue) == 0 {
+		t.Error("ProofValue is empty after Sign")
+	}
+	// Body gains the Data Integrity context, and is the signed document
+	// without its proof.
+	document, _ := signedFields(t, signed)
+	delete(document, "proof")
+	if want := mustMarshal(t, document); !bytes.Equal(vd.Body, want) {
+		t.Errorf("Body = %s, want %s", vd.Body, want)
+	}
+	requireNoError(t, vd.Verify(signer.verifier()))
+}
+
+func TestSign_AddsDataIntegrityContext(t *testing.T) {
+	const v2 = "https://www.w3.org/ns/credentials/v2"
+	tests := []struct {
+		name        string
+		context     any // nil means the doc has no @context
+		wantContext string
+	}{
+		{name: "absent", wantContext: `["` + DataIntegrityContext + `"]`},
+		{name: "null", context: json.RawMessage("null"), wantContext: `["` + DataIntegrityContext + `"]`},
+		{name: "string", context: v2, wantContext: `["` + v2 + `","` + DataIntegrityContext + `"]`},
+		{name: "array", context: []any{v2}, wantContext: `["` + v2 + `","` + DataIntegrityContext + `"]`},
+		{
+			name:        "array with object",
+			context:     []any{v2, map[string]any{"name": "https://schema.org/name"}},
+			wantContext: `["` + v2 + `",{"name":"https://schema.org/name"},"` + DataIntegrityContext + `"]`,
+		},
+		{name: "already the string", context: DataIntegrityContext, wantContext: `"` + DataIntegrityContext + `"`},
+		{name: "already in the array", context: []any{DataIntegrityContext, v2}, wantContext: `["` + DataIntegrityContext + `","` + v2 + `"]`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			doc := sampleDoc()
+			if tt.context != nil {
+				doc["@context"] = tt.context
+			}
+			signer := mustECDSASigner(t)
+			vd := mustMakeVerifiableDoc(t, doc, CryptoSuiteECDSAJCS2019)
+			signed := mustSign(t, &vd, signer)
+
+			document, proof := signedFields(t, signed)
+			requireRawField(t, document, "@context", tt.wantContext)
+			requireRawField(t, proof, "@context", "")
+
+			requireNoError(t, mustParseDoc(t, signed).Verify(signer.verifier()))
+		})
+	}
+}
+
+func TestSign_ProofTimestamps(t *testing.T) {
+	created := time.Date(2026, 3, 28, 15, 40, 0, 0, time.UTC)
+	expires := created.Add(24 * time.Hour)
+	tests := []struct {
+		name        string
+		created     time.Time
+		expires     time.Time
+		wantCreated string // empty means the field must be absent
+		wantExpires string // empty means the field must be absent
+	}{
+		{name: "created only", created: created, wantCreated: `"2026-03-28T15:40:00Z"`},
+		{
+			name:        "created and expires",
+			created:     created,
+			expires:     expires,
+			wantCreated: `"2026-03-28T15:40:00Z"`,
+			wantExpires: `"2026-03-29T15:40:00Z"`,
+		},
+		{name: "neither"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			signer := mustECDSASigner(t)
+			vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
+			vd.Proof.Created = tt.created
+			vd.Proof.Expires = tt.expires
+			signed := mustSign(t, &vd, signer)
+
+			_, proof := signedFields(t, signed)
+			requireRawField(t, proof, "created", tt.wantCreated)
+			requireRawField(t, proof, "expires", tt.wantExpires)
+
+			parsed := mustParseDoc(t, signed)
+			if !parsed.Proof.Created.Equal(tt.created) || !parsed.Proof.Expires.Equal(tt.expires) {
+				t.Errorf("parsed created, expires = %s, %s; want %s, %s",
+					parsed.Proof.Created, parsed.Proof.Expires, tt.created, tt.expires)
+			}
+			// Verify while the proof is valid. Some cases expired in the past.
+			requireNoError(t, parsed.VerifyAt(signer.verifier(), tt.created))
+		})
+	}
+}
+
+// A freshly made and signed doc writes created as whole-second UTC, such as
+// "2026-03-28T15:40:00Z", and leaves expires out.
+func TestSign_DefaultTimestampFormat(t *testing.T) {
+	vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
+	_, proof := signedFields(t, mustSign(t, &vd, mustECDSASigner(t)))
+
+	wholeSecondUTC := regexp.MustCompile(`^"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"$`)
+	if got := string(proof["created"]); !wholeSecondUTC.MatchString(got) {
+		t.Errorf("created = %s, want whole-second UTC", got)
+	}
+	requireRawField(t, proof, "expires", "")
 }
 
 // Sign rejects a signer whose signature type does not match the cryptosuite.
-// An unknown suite matches neither ECDSA nor EdDSA.
+// An unknown suite matches no signer.
 func TestSign_RejectsSuiteMismatch(t *testing.T) {
 	ecdsaSigner := mustECDSASigner(t)
+	eddsaSigner := stubSigner{kind: SigTypeEDDSA}
 	tests := []struct {
 		name   string
 		suite  CryptoSuiteType
 		signer Signer
 		want   string
 	}{
-		{
-			name:   "ecdsa signer with eddsa-jcs-2022",
-			suite:  CryptoSuite_EDDSA_JCS_2022,
-			signer: ecdsaSigner,
-			want:   "SigType_ECDSA does not match cryptosuite eddsa-jcs-2022",
-		},
-		{
-			name:   "ecdsa signer with eddsa-rdfc-2022",
-			suite:  CryptoSuite_EDDSA_RDFC_2022,
-			signer: ecdsaSigner,
-			want:   "SigType_ECDSA does not match cryptosuite eddsa-rdfc-2022",
-		},
-		{
-			name:   "ecdsa signer with unknown suite",
-			suite:  CryptoSuite_Unknown,
-			signer: ecdsaSigner,
-			want:   "SigType_ECDSA does not match cryptosuite Unknown crypto suite",
-		},
-		{
-			name:   "eddsa signer with ecdsa-jcs-2019",
-			suite:  CryptoSuite_ECDSA_JCS_2019,
-			signer: stubSigner{kind: SigType_EDDSA},
-			want:   "SigType_EDDSA does not match cryptosuite ecdsa-jcs-2019",
-		},
-		{
-			name:   "eddsa signer with ecdsa-rdfc-2019",
-			suite:  CryptoSuite_ECDSA_RDFC_2019,
-			signer: stubSigner{kind: SigType_EDDSA},
-			want:   "SigType_EDDSA does not match cryptosuite ecdsa-rdfc-2019",
-		},
-		{
-			name:   "unknown signer type",
-			suite:  CryptoSuite_ECDSA_JCS_2019,
-			signer: stubSigner{kind: SigType(99)},
-			want:   "Unknown verifier type does not match cryptosuite ecdsa-jcs-2019",
-		},
+		{name: "ECDSA signer, eddsa-jcs-2022", suite: CryptoSuiteEDDSAJCS2022, signer: ecdsaSigner, want: "signer type ECDSA does not match cryptosuite eddsa-jcs-2022"},
+		{name: "ECDSA signer, eddsa-rdfc-2022", suite: CryptoSuiteEDDSARDFC2022, signer: ecdsaSigner, want: "signer type ECDSA does not match cryptosuite eddsa-rdfc-2022"},
+		{name: "ECDSA signer, unknown suite", suite: CryptoSuiteUnknown, signer: ecdsaSigner, want: "signer type ECDSA does not match cryptosuite unknown crypto suite"},
+		{name: "EdDSA signer, ecdsa-jcs-2019", suite: CryptoSuiteECDSAJCS2019, signer: eddsaSigner, want: "signer type EdDSA does not match cryptosuite ecdsa-jcs-2019"},
+		{name: "EdDSA signer, ecdsa-rdfc-2019", suite: CryptoSuiteECDSARDFC2019, signer: eddsaSigner, want: "signer type EdDSA does not match cryptosuite ecdsa-rdfc-2019"},
+		{name: "unknown signer type", suite: CryptoSuiteECDSAJCS2019, signer: stubSigner{kind: SigType(99)}, want: "signer type unknown signature type does not match"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1279,38 +774,52 @@ func TestSign_RejectsSuiteMismatch(t *testing.T) {
 	}
 }
 
-// RDFC suites use the same signature type as the matching JCS suite, so the
-// signer check passes. Hashing for RDFC is unsupported, and Sign fails there.
+// The RDFC suites pass the signer check, but this package cannot hash them.
 func TestSign_UnsupportedCryptoSuite(t *testing.T) {
 	tests := []struct {
-		name   string
 		suite  CryptoSuiteType
 		signer Signer
-		want   string
 	}{
-		{
-			name:   "ecdsa-rdfc-2019",
-			suite:  CryptoSuite_ECDSA_RDFC_2019,
-			signer: mustECDSASigner(t),
-			want:   "Error hashing doc: Unsupported hashing for cryptosuite ecdsa-rdfc-2019",
-		},
-		{
-			name:   "eddsa-rdfc-2022",
-			suite:  CryptoSuite_EDDSA_RDFC_2022,
-			signer: stubSigner{kind: SigType_EDDSA},
-			want:   "Error hashing doc: Unsupported hashing for cryptosuite eddsa-rdfc-2022",
-		},
+		{suite: CryptoSuiteECDSARDFC2019, signer: mustECDSASigner(t)},
+		{suite: CryptoSuiteEDDSARDFC2022, signer: stubSigner{kind: SigTypeEDDSA}},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+		t.Run(tt.suite.String(), func(t *testing.T) {
 			t.Parallel()
 			vd := mustMakeVerifiableDoc(t, sampleDoc(), tt.suite)
-			requireSignError(t, &vd, tt.signer, tt.want)
+			requireSignError(t, &vd, tt.signer, "hashing document: unsupported cryptosuite "+tt.suite.String())
 		})
 	}
 }
 
-// Make marshals any JSON value. Sign then needs an object so it can embed the proof.
+// Sign must refuse to produce a doc that ParseDoc would reject.
+func TestSign_RejectsInvalidProofConfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Proof)
+		want   string
+	}{
+		{name: "wrong type", mutate: func(p *Proof) { p.ProofType = "Ed25519Signature2020" }, want: `unsupported proof type "Ed25519Signature2020"`},
+		{name: "empty type", mutate: func(p *Proof) { p.ProofType = "" }, want: `unsupported proof type ""`},
+		{name: "wrong purpose", mutate: func(p *Proof) { p.ProofPurpose = "authentication" }, want: `unsupported proof purpose "authentication"`},
+		{name: "empty purpose", mutate: func(p *Proof) { p.ProofPurpose = "" }, want: `unsupported proof purpose ""`},
+		{name: "no verification method", mutate: func(p *Proof) { p.VerificationMethod = nil }, want: "proof has no verificationMethod"},
+		{name: "expires at created", mutate: func(p *Proof) { p.Expires = p.Created }, want: "proof expires at or before it was created"},
+		{name: "expires before created", mutate: func(p *Proof) { p.Expires = p.Created.Add(-time.Second) }, want: "proof expires at or before it was created"},
+	}
+	signer := mustECDSASigner(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
+			tt.mutate(&vd.Proof)
+			requireSignError(t, &vd, signer, tt.want)
+		})
+	}
+}
+
+// MakeVerifiableDoc encodes any JSON value. Sign then needs an object, so it
+// can embed the proof.
 func TestSign_RejectsNonObjectBody(t *testing.T) {
 	var nilPtr *struct{ ID int }
 	tests := []struct {
@@ -1321,27 +830,24 @@ func TestSign_RejectsNonObjectBody(t *testing.T) {
 		{name: "nil", doc: nil, want: "document is null"},
 		{name: "nil pointer", doc: nilPtr, want: "document is null"},
 		{name: "nil slice", doc: []int(nil), want: "document is null"},
-		{name: "number", doc: 101, want: "json: cannot unmarshal number"},
-		{name: "string", doc: "Alice", want: "json: cannot unmarshal string"},
-		{name: "bool", doc: true, want: "json: cannot unmarshal bool"},
-		{name: "array", doc: []int{1, 2}, want: "json: cannot unmarshal array"},
-		{name: "empty array", doc: []int{}, want: "json: cannot unmarshal array"},
-		{name: "raw array", doc: json.RawMessage(`[1,2]`), want: "json: cannot unmarshal array"},
-		{name: "raw string", doc: json.RawMessage(`"Alice"`), want: "json: cannot unmarshal string"},
 		{name: "raw null", doc: json.RawMessage(`null`), want: "document is null"},
+		{name: "number", doc: 101, want: "parsing document: json: cannot unmarshal number"},
+		{name: "string", doc: "Alice", want: "parsing document: json: cannot unmarshal string"},
+		{name: "bool", doc: true, want: "parsing document: json: cannot unmarshal bool"},
+		{name: "array", doc: []int{1, 2}, want: "parsing document: json: cannot unmarshal array"},
 	}
 	signer := mustECDSASigner(t)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			vd := mustMakeVerifiableDoc(t, tt.doc, CryptoSuite_ECDSA_JCS_2019)
-			requireSignError(t, &vd, signer, "Error parsing base doc: "+tt.want)
+			vd := mustMakeVerifiableDoc(t, tt.doc, CryptoSuiteECDSAJCS2019)
+			requireSignError(t, &vd, signer, tt.want)
 		})
 	}
 }
 
-// encoding/json accepts some documents that JCS canonicalization rejects.
-// Make therefore succeeds, and Sign fails while hashing.
+// encoding/json accepts some documents that JCS cannot canonicalize. Sign
+// rejects them before it changes anything, as ParseDoc does.
 func TestSign_RejectsUncanonicalizableBody(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1356,13 +862,13 @@ func TestSign_RejectsUncanonicalizableBody(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			vd := mustMakeVerifiableDoc(t, json.RawMessage(tt.raw), CryptoSuite_ECDSA_JCS_2019)
-			requireSignError(t, &vd, signer, "Error hashing doc: "+tt.want)
+			vd := mustMakeVerifiableDoc(t, json.RawMessage(tt.raw), CryptoSuiteECDSAJCS2019)
+			requireSignError(t, &vd, signer, "parsing document: "+tt.want)
 		})
 	}
 }
 
-// A body that is not JSON fails in GetHash, before a signature is produced.
+// A Body set by hand that is not JSON fails before anything is signed.
 func TestSign_RejectsInvalidBody(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1375,214 +881,240 @@ func TestSign_RejectsInvalidBody(t *testing.T) {
 		{name: "trailing junk", body: []byte(`{"id":1}x`), want: "Improperly terminated JSON object"},
 	}
 	signer := mustECDSASigner(t)
-	vm := did.MustParseDIDURL("did:web:example.com:user:101#key-1")
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			vd := VerifiableDoc{
-				Body: tt.body,
-				Proof: Proof{
-					ProofType:          "DataIntegrityProof",
-					ProofPurpose:       "assertionMethod",
-					CryptoSuite:        CryptoSuite_ECDSA_JCS_2019,
-					VerificationMethod: &vm,
-					Created:            time.Date(2026, 3, 28, 15, 40, 0, 0, time.UTC),
-				},
-			}
-			requireSignError(t, &vd, signer, "Error hashing doc: "+tt.want)
+			vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
+			vd.Body = tt.body
+			requireSignError(t, &vd, signer, "parsing document: "+tt.want)
 		})
 	}
 }
 
-// An ECDSA key whose scalar is zero, negative, or larger than the curve order
-// cannot sign. A signer that returns its own error is reported the same way.
+// An ECDSA key whose scalar is outside 1 to N-1 cannot sign. A signer that
+// fails on its own is reported the same way.
 func TestSign_InvalidSigner(t *testing.T) {
+	withScalar := func(d *big.Int) Signer {
+		signer := mustECDSASigner(t)
+		signer.signKey.D = d
+		return signer
+	}
 	tests := []struct {
 		name   string
-		signer func(t *testing.T) Signer
+		signer Signer
 		want   string
 	}{
-		{
-			name: "zero scalar",
-			signer: func(t *testing.T) Signer {
-				signer := mustECDSASigner(t)
-				signer.signKey.D = big.NewInt(0)
-				return signer
-			},
-			want: "Error signing doc: Error signing: ecdsa: private key scalar is zero or negative",
-		},
-		{
-			name: "negative scalar",
-			signer: func(t *testing.T) Signer {
-				signer := mustECDSASigner(t)
-				signer.signKey.D = big.NewInt(-1)
-				return signer
-			},
-			want: "Error signing doc: Error signing: ecdsa: private key scalar is zero or negative",
-		},
-		{
-			name: "scalar too large",
-			signer: func(t *testing.T) Signer {
-				signer := mustECDSASigner(t)
-				signer.signKey.D = new(big.Int).Lsh(big.NewInt(1), 256)
-				return signer
-			},
-			want: "Error signing doc: Error signing: ecdsa: private key scalar too large",
-		},
-		{
-			name: "sign error",
-			signer: func(*testing.T) Signer {
-				return stubSigner{kind: SigType_ECDSA, signErr: errors.New("key unavailable")}
-			},
-			want: "Error signing doc: key unavailable",
-		},
+		{name: "zero scalar", signer: withScalar(big.NewInt(0)), want: "signing document: signing: ecdsa: private key scalar is zero or negative"},
+		{name: "negative scalar", signer: withScalar(big.NewInt(-1)), want: "signing document: signing: ecdsa: private key scalar is zero or negative"},
+		{name: "scalar too large", signer: withScalar(new(big.Int).Lsh(big.NewInt(1), 256)), want: "signing document: signing: ecdsa: private key scalar too large"},
+		{name: "sign error", signer: stubSigner{kind: SigTypeECDSA, signErr: errors.New("key unavailable")}, want: "signing document: key unavailable"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuite_ECDSA_JCS_2019)
-			requireSignError(t, &vd, tt.signer(t), tt.want)
+			vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
+			requireSignError(t, &vd, tt.signer, tt.want)
 		})
 	}
 }
 
-func sampleDoc() map[string]any {
-	return map[string]any{"id": 101, "name": "Alice"}
+// Signing a body that already has a proof would hash the old proof into the
+// body and then overwrite it, giving a doc that can never verify.
+func TestSign_RejectsBodyWithProof(t *testing.T) {
+	doc := map[string]any{"id": 101, "proof": map[string]any{"type": "DataIntegrityProof"}}
+	vd := mustMakeVerifiableDoc(t, doc, CryptoSuiteECDSAJCS2019)
+	requireSignError(t, &vd, mustECDSASigner(t), "document already has a proof")
 }
 
-func mustMakeVerifiableDoc(t *testing.T, doc any, cs CryptoSuiteType) VerifiableDoc {
-	t.Helper()
-	vm := did.MustParseDIDURL("did:web:example.com:user:101#key-1")
-	vd, err := MakeVerifiableDoc(doc, cs, &vm)
-	if err != nil {
-		t.Fatalf("Make: %v", err)
-	}
-	return vd
-}
+// Sign must not overwrite an existing signature, whether the doc was signed
+// here or parsed from a signed document.
+func TestSign_RejectsSignedDoc(t *testing.T) {
+	signer := mustECDSASigner(t)
+	signedHere := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
+	parsed := mustParseDoc(t, mustSign(t, &signedHere, signer))
 
-func mustECDSASigner(t *testing.T) *ECDSASigner {
-	t.Helper()
-	signer, err := GenerateECDSASigner(elliptic.P256())
-	if err != nil {
-		t.Fatalf("GenerateECDSASigner: %v", err)
-	}
-	return signer
-}
-
-func requireMakeError(t *testing.T, doc any, want string) {
-	t.Helper()
-	vm := did.MustParseDIDURL("did:web:example.com:user:101#key-1")
-	vd, err := MakeVerifiableDoc(doc, CryptoSuite_ECDSA_JCS_2019, &vm)
-	if err == nil {
-		t.Fatal("Make succeeded")
-	}
-	if vd.Body != nil || vd.Proof.ProofType != "" {
-		t.Fatalf("Make returned a partial doc on error: body %s type %q", vd.Body, vd.Proof.ProofType)
-	}
-	if !strings.Contains(err.Error(), want) {
-		t.Fatalf("error = %q, want substring %q", err, want)
+	for name, vd := range map[string]VerifiableDoc{"signed here": signedHere, "parsed": parsed} {
+		t.Run(name, func(t *testing.T) {
+			requireSignError(t, &vd, signer, "document is already signed")
+		})
 	}
 }
 
-func requireSignError(t *testing.T, vd *VerifiableDoc, signer Signer, want string) {
-	t.Helper()
-	signed, err := vd.Sign(signer)
-	if err == nil {
-		t.Fatalf("Sign succeeded: %s", signed)
-	}
-	if len(signed) != 0 {
-		t.Fatalf("Sign returned %q with error %v", signed, err)
-	}
-	if !strings.Contains(err.Error(), want) {
-		t.Fatalf("error = %q, want substring %q", err, want)
-	}
-}
+// --- Verify ---
 
-// refuseJSON is a document whose MarshalJSON method fails.
-type refuseJSON struct{}
+func TestVerifyAt_ProofTimes(t *testing.T) {
+	created := time.Date(2026, 3, 28, 15, 40, 0, 0, time.UTC)
+	expires := created.Add(24 * time.Hour)
+	vd, verifier := signedTestDoc(t, sampleDoc(), created, expires)
 
-func (refuseJSON) MarshalJSON() ([]byte, error) {
-	return nil, errors.New("refuse to marshal")
-}
-
-// stubSigner stands in for signature types this package cannot generate,
-// and for a sign call that fails on its own.
-type stubSigner struct {
-	kind    SigType
-	signErr error
-}
-
-func (s stubSigner) sign([]byte) ([]byte, error) {
-	if s.signErr != nil {
-		return nil, s.signErr
-	}
-	return []byte{0x01}, nil
-}
-
-func (s stubSigner) sigType() SigType { return s.kind }
-
-func (s stubSigner) hash(data []byte) []byte {
-	sum := sha256.Sum256(data)
-	return sum[:]
-}
-
-func (s stubSigner) verifier() SigVerifier { return nil }
-
-func TestVerifyAgainstDID(t *testing.T) {
-
-}
-
-func TestCryptoSuiteType_StringAndParse(t *testing.T) {
 	tests := []struct {
-		suite CryptoSuiteType
-		text  string
+		name    string
+		at      time.Time
+		wantErr error
 	}{
-		{CryptoSuite_ECDSA_JCS_2019, "ecdsa-jcs-2019"},
-		{CryptoSuite_ECDSA_RDFC_2019, "ecdsa-rdfc-2019"},
-		{CryptoSuite_EDDSA_JCS_2022, "eddsa-jcs-2022"},
-		{CryptoSuite_EDDSA_RDFC_2022, "eddsa-rdfc-2022"},
+		{name: "before created", at: created.Add(-time.Second), wantErr: ErrProofNotYetValid},
+		{name: "at created", at: created},
+		{name: "between created and expires", at: created.Add(time.Hour)},
+		{name: "just before expires", at: expires.Add(-time.Nanosecond)},
+		{name: "at expires", at: expires, wantErr: ErrProofExpired},
+		{name: "after expires", at: expires.Add(time.Hour), wantErr: ErrProofExpired},
+		{name: "same instant in another zone", at: created.In(time.FixedZone("UTC+8", 8*60*60))},
 	}
 	for _, tt := range tests {
-		t.Run(tt.text, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-
-			if got := tt.suite.String(); got != tt.text {
-				t.Errorf("String() = %q, want %q", got, tt.text)
+			err := vd.VerifyAt(verifier, tt.at)
+			if tt.wantErr == nil {
+				requireNoError(t, err)
+				return
 			}
-			if got := ParseCryptoSuite(tt.text); got != tt.suite {
-				t.Errorf("ParseCryptoSuite(%q) = %v, want %v", tt.text, got, tt.suite)
-			}
-
-			var parsed CryptoSuiteType
-			if err := parsed.UnmarshalText([]byte(tt.text)); err != nil {
-				t.Fatalf("UnmarshalText(%q): %v", tt.text, err)
-			}
-			if parsed != tt.suite {
-				t.Errorf("UnmarshalText(%q) = %v, want %v", tt.text, parsed, tt.suite)
-			}
+			requireErrorIs(t, err, tt.wantErr)
 		})
 	}
 }
 
-func TestCryptoSuiteType_InvalidString(t *testing.T) {
-	const invalid = "not-a-suite"
+// created and expires are both optional. A missing one sets no bound.
+func TestVerifyAt_OptionalProofTimes(t *testing.T) {
+	created := time.Date(2026, 3, 28, 15, 40, 0, 0, time.UTC)
+	farPast := created.AddDate(-100, 0, 0)
+	farFuture := created.AddDate(100, 0, 0)
+	tests := []struct {
+		name    string
+		created time.Time
+		at      time.Time
+	}{
+		{name: "no expires, far future", created: created, at: farFuture},
+		{name: "no created, far past", at: farPast},
+		{name: "no created, far future", at: farFuture},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			vd, verifier := signedTestDoc(t, sampleDoc(), tt.created, time.Time{})
+			requireNoError(t, vd.VerifyAt(verifier, tt.at))
+		})
+	}
+}
 
-	if got := ParseCryptoSuite(invalid); got != CryptoSuite_Unknown {
-		t.Errorf("ParseCryptoSuite(%q) = %v, want %v", invalid, got, CryptoSuite_Unknown)
+func TestVerify_UsesCurrentTime(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	tests := []struct {
+		name    string
+		created time.Time
+		expires time.Time
+		wantErr error
+	}{
+		{name: "valid now", created: now.Add(-time.Hour), expires: now.Add(time.Hour)},
+		{name: "expired", created: now.Add(-2 * time.Hour), expires: now.Add(-time.Hour), wantErr: ErrProofExpired},
+		{name: "created in the future", created: now.Add(time.Hour), wantErr: ErrProofNotYetValid},
 	}
-	if got := CryptoSuiteType(CryptoSuite_Unknown).String(); got != "Unknown crypto suite" {
-		t.Errorf("Unknown.String() = %q, want %q", got, "Unknown crypto suite")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			vd, verifier := signedTestDoc(t, sampleDoc(), tt.created, tt.expires)
+			err := vd.Verify(verifier)
+			if tt.wantErr == nil {
+				requireNoError(t, err)
+				return
+			}
+			requireErrorIs(t, err, tt.wantErr)
+		})
 	}
+}
 
-	suite := CryptoSuiteType(CryptoSuite_ECDSA_JCS_2019)
-	err := suite.UnmarshalText([]byte(invalid))
-	if err == nil {
-		t.Fatal("UnmarshalText succeeded for an invalid suite")
+func TestVerify_RejectsSuiteMismatch(t *testing.T) {
+	ecdsaDoc, _ := signedTestDoc(t, sampleDoc(), time.Time{}, time.Time{})
+	t.Run("ECDSA doc, EdDSA key", func(t *testing.T) {
+		requireErrorContains(t, ecdsaDoc.Verify(mustVerifier(t, vectorEd25519.publicKey)), "verifier type EdDSA does not match cryptosuite ecdsa-jcs-2019")
+	})
+	t.Run("EdDSA doc, ECDSA key", func(t *testing.T) {
+		requireErrorContains(t, vectorDoc(t, vectorEd25519).Verify(mustVerifier(t, vectorP256.publicKey)), "verifier type ECDSA does not match cryptosuite eddsa-jcs-2022")
+	})
+}
+
+func TestVerify_UnsupportedCryptoSuite(t *testing.T) {
+	vd := mustParseDoc(t, []byte(rdfcExampleDoc))
+	requireErrorContains(t, vd.Verify(mustVerifier(t, vectorEd25519.publicKey)), "unsupported cryptosuite eddsa-rdfc-2022")
+}
+
+func TestVerify_NilVerifier(t *testing.T) {
+	vd, _ := signedTestDoc(t, sampleDoc(), time.Time{}, time.Time{})
+	requireErrorContains(t, vd.Verify(nil), "no verifier given")
+}
+
+// A malformed signature is an invalid signature, and the error says why.
+func TestVerify_MalformedSignature(t *testing.T) {
+	vd := vectorDoc(t, vectorP256)
+	vd.Proof.ProofValue = vd.Proof.ProofValue[:10]
+	err := vd.Verify(mustVerifier(t, vectorP256.publicKey))
+	requireErrorIs(t, err, ErrInvalidSignature)
+	requireErrorContains(t, err, "wrong signature size")
+}
+
+// --- End to end with a DID document ---
+
+// A signer publishes its key in a DID document. A verifier parses the signed
+// doc, finds the key the proof names, and verifies.
+func TestSignAndVerifyWithDID(t *testing.T) {
+	signer := mustECDSASigner(t)
+	keyURL := did.MustParseDIDURL(testKeyURL)
+	vm, err := did.NewVerificationMethod(keyURL, ssi.JsonWebKey2020, keyURL.DID, &signer.signKey.PublicKey)
+	if err != nil {
+		t.Fatalf("did.NewVerificationMethod: %v", err)
 	}
-	if !strings.Contains(err.Error(), invalid) {
-		t.Errorf("error = %q, want it to mention %q", err, invalid)
+	published := &did.Document{Context: []any{did.DIDContextV1URI()}, ID: keyURL.DID}
+	published.AddAssertionMethod(vm)
+
+	vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
+	signed := mustSign(t, &vd, signer)
+
+	// The verifier receives both documents as JSON.
+	didDoc, err := did.ParseDocument(string(mustMarshal(t, published)))
+	if err != nil {
+		t.Fatalf("did.ParseDocument: %v", err)
 	}
-	if suite != CryptoSuite_ECDSA_JCS_2019 {
-		t.Errorf("suite = %v after failed UnmarshalText, want it unchanged", suite)
+	received := mustParseDoc(t, signed)
+	verifier, err := GetAssertionVerifier(didDoc, received.Proof.VerificationMethod)
+	if err != nil {
+		t.Fatalf("GetAssertionVerifier: %v", err)
 	}
+	requireNoError(t, received.Verify(verifier))
+}
+
+// This doc was signed by an earlier version of this package. Its created
+// time has a zone offset and fractional seconds, and it has a non-standard
+// "expiry" field. Both are covered by the signature, so it still verifies.
+func TestVerifyLegacyDocFromDID(t *testing.T) {
+	const signed = `{"id":101,"name":"Alice","proof":{"type":"DataIntegrityProof","proofPurpose":"assertionMethod","cryptosuite":"ecdsa-jcs-2019","verificationMethod":"did:web:example.com:user:101#key-1","proofValue":"z41BkGy5VEDeqrKqFwea5br1gmaZKT9YESoCVz2ESsvoFScazx6Le8VytRisoKjkzD63aF8DH38U74sjaBLu7CMzF","created":"2026-10-06T15:06:41.070247+08:00","expiry":"0001-01-01T00:00:00Z"}}`
+	const didDocument = `{
+  "@context": "https://www.w3.org/ns/did/v1",
+  "id": "did:web:example.com:user:101",
+  "assertionMethod": ["did:web:example.com:user:101#key-1"],
+  "verificationMethod": [
+    {
+      "id": "did:web:example.com:user:101#key-1",
+      "type": "JsonWebKey2020",
+      "controller": "did:web:example.com:user:101",
+      "publicKeyJwk": {
+        "kty": "EC",
+        "crv": "P-256",
+        "x": "og9qNE10V4aSHCTMJFCAcciUfbUqk_pe4MXlqVqEEow",
+        "y": "NirPmr7CcLI6GVlNNCvOrA7YKfnj40VT8bEKMZ591QU"
+      }
+    }
+  ]
+}`
+	vd := mustParseDoc(t, []byte(signed))
+	didDoc, err := did.ParseDocument(didDocument)
+	if err != nil {
+		t.Fatalf("did.ParseDocument: %v", err)
+	}
+	if vd.Proof.VerificationMethod.DID != didDoc.ID {
+		t.Fatalf("proof DID = %s, DID document ID = %s", vd.Proof.VerificationMethod.DID, didDoc.ID)
+	}
+	verifier, err := GetAssertionVerifier(didDoc, vd.Proof.VerificationMethod)
+	if err != nil {
+		t.Fatalf("GetAssertionVerifier: %v", err)
+	}
+	requireNoError(t, vd.Verify(verifier))
 }
