@@ -9,6 +9,7 @@ import (
 	"maps"
 	"math"
 	"math/big"
+	"reflect"
 	"regexp"
 	"testing"
 	"time"
@@ -25,14 +26,11 @@ func sampleDoc() map[string]any {
 	return map[string]any{"id": 101, "name": "Alice"}
 }
 
-func mustMakeVerifiableDoc(t *testing.T, doc any, cs CryptoSuiteType) VerifiableDoc {
-	t.Helper()
+// testProofOptions returns options for a proof made with cs by testKeyURL,
+// created now.
+func testProofOptions(cs CryptoSuiteType) ProofOptions {
 	vm := did.MustParseDIDURL(testKeyURL)
-	vd, err := MakeVerifiableDoc(doc, cs, &vm)
-	if err != nil {
-		t.Fatalf("MakeVerifiableDoc: %v", err)
-	}
-	return vd
+	return NewProofOptions(cs, &vm)
 }
 
 func mustECDSASigner(t *testing.T) *ECDSASigner {
@@ -44,16 +42,16 @@ func mustECDSASigner(t *testing.T) *ECDSASigner {
 	return signer
 }
 
-func mustSign(t *testing.T, vd *VerifiableDoc, signer Signer) []byte {
+func mustSign(t *testing.T, doc any, opts ProofOptions, signer Signer) SignedDoc {
 	t.Helper()
-	signed, err := vd.Sign(signer)
+	signed, err := Sign(doc, opts, signer)
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
 	}
 	return signed
 }
 
-func mustParseDoc(t *testing.T, data []byte) VerifiableDoc {
+func mustParseDoc(t *testing.T, data []byte) SignedDoc {
 	t.Helper()
 	vd, err := ParseDoc(data)
 	if err != nil {
@@ -64,13 +62,13 @@ func mustParseDoc(t *testing.T, data []byte) VerifiableDoc {
 
 // signedTestDoc signs doc with the given proof times, then parses the result
 // as a verifier would receive it. It also returns a verifier for the key.
-func signedTestDoc(t *testing.T, doc any, created, expires time.Time) (VerifiableDoc, SigVerifier) {
+func signedTestDoc(t *testing.T, doc any, created, expires time.Time) (SignedDoc, SigVerifier) {
 	t.Helper()
 	signer := mustECDSASigner(t)
-	vd := mustMakeVerifiableDoc(t, doc, CryptoSuiteECDSAJCS2019)
-	vd.Proof.Created = created
-	vd.Proof.Expires = expires
-	return mustParseDoc(t, mustSign(t, &vd, signer)), signer.verifier()
+	opts := testProofOptions(CryptoSuiteECDSAJCS2019)
+	opts.Created = created
+	opts.Expires = expires
+	return mustParseDoc(t, mustSign(t, doc, opts, signer).Raw), signer.verifier()
 }
 
 func requireParseDocError(t *testing.T, doc string, want string) {
@@ -79,12 +77,12 @@ func requireParseDocError(t *testing.T, doc string, want string) {
 	requireErrorContains(t, err, want)
 }
 
-func requireSignError(t *testing.T, vd *VerifiableDoc, signer Signer, want string) {
+func requireSignError(t *testing.T, doc any, opts ProofOptions, signer Signer, want string) {
 	t.Helper()
-	signed, err := vd.Sign(signer)
+	signed, err := Sign(doc, opts, signer)
 	requireErrorContains(t, err, want)
-	if signed != nil {
-		t.Errorf("Sign returned %s with an error", signed)
+	if !reflect.DeepEqual(signed, SignedDoc{}) {
+		t.Errorf("Sign returned %s with an error", signed.Raw)
 	}
 }
 
@@ -233,7 +231,8 @@ func TestW3CVectors_HashData(t *testing.T) {
 	for _, vec := range w3cVectors {
 		t.Run(vec.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := vectorDoc(t, vec).hashData(mustVerifier(t, vec.publicKey).hash)
+			vd := vectorDoc(t, vec)
+			got, err := hashData(vd.Proof.CryptoSuite, vd.Body, vd.RawProofOptions, mustVerifier(t, vec.publicKey).hash)
 			if err != nil {
 				t.Fatalf("hashData: %v", err)
 			}
@@ -260,29 +259,29 @@ func TestW3CVectors_Verify(t *testing.T) {
 func TestW3CVectors_RejectTampering(t *testing.T) {
 	tests := []struct {
 		name   string
-		mutate func(*testing.T, *VerifiableDoc)
+		mutate func(*testing.T, *SignedDoc)
 	}{
 		{
 			name: "body",
-			mutate: func(t *testing.T, vd *VerifiableDoc) {
+			mutate: func(t *testing.T, vd *SignedDoc) {
 				vd.Body = replaceOnce(t, vd.Body, `"Alumni Credential"`, `"Tampered"`)
 			},
 		},
 		{
 			name: "proof options",
-			mutate: func(t *testing.T, vd *VerifiableDoc) {
-				vd.rawProofOptions = replaceOnce(t, vd.rawProofOptions, "2023-02-24", "2023-02-25")
+			mutate: func(t *testing.T, vd *SignedDoc) {
+				vd.RawProofOptions = replaceOnce(t, vd.RawProofOptions, "2023-02-24", "2023-02-25")
 			},
 		},
 		{
 			name: "signature",
-			mutate: func(_ *testing.T, vd *VerifiableDoc) {
+			mutate: func(_ *testing.T, vd *SignedDoc) {
 				vd.Proof.ProofValue = flipBit(vd.Proof.ProofValue, 0)
 			},
 		},
 		{
 			name: "signature length",
-			mutate: func(_ *testing.T, vd *VerifiableDoc) {
+			mutate: func(_ *testing.T, vd *SignedDoc) {
 				vd.Proof.ProofValue = vd.Proof.ProofValue[:len(vd.Proof.ProofValue)-1]
 			},
 		},
@@ -372,7 +371,7 @@ func TestParseDoc(t *testing.T) {
 	// The proof options keep fields that Proof does not model, so they are
 	// still covered by the signature.
 	var options map[string]json.RawMessage
-	mustUnmarshal(t, vd.rawProofOptions, &options)
+	mustUnmarshal(t, vd.RawProofOptions, &options)
 	requireRawField(t, options, "habla", `"blah"`)
 	requireRawField(t, options, "proofValue", "")
 }
@@ -546,72 +545,29 @@ func TestParseDoc_ExpiresNotAfterCreated(t *testing.T) {
 	}
 }
 
-// --- MakeVerifiableDoc ---
+// --- NewProofOptions ---
 
-func TestMakeVerifiableDoc(t *testing.T) {
+func TestNewProofOptions(t *testing.T) {
 	before := time.Now().Truncate(time.Second)
-	vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
+	opts := testProofOptions(CryptoSuiteECDSAJCS2019)
 	after := time.Now()
 
-	p := vd.Proof
-	if p.ProofType != "DataIntegrityProof" || p.ProofPurpose != "assertionMethod" {
-		t.Errorf("type, purpose = %q, %q", p.ProofType, p.ProofPurpose)
+	if opts.CryptoSuite != CryptoSuiteECDSAJCS2019 {
+		t.Errorf("cryptosuite = %v, want %v", opts.CryptoSuite, CryptoSuiteECDSAJCS2019)
 	}
-	if p.CryptoSuite != CryptoSuiteECDSAJCS2019 {
-		t.Errorf("cryptosuite = %v, want %v", p.CryptoSuite, CryptoSuiteECDSAJCS2019)
-	}
-	if got := p.VerificationMethod.String(); got != testKeyURL {
+	if got := opts.VerificationMethod.String(); got != testKeyURL {
 		t.Errorf("verificationMethod = %s, want %s", got, testKeyURL)
-	}
-	if got, want := string(vd.Body), `{"id":101,"name":"Alice"}`; got != want {
-		t.Errorf("body = %s, want %s", got, want)
 	}
 
 	// created is now, in UTC, with whole seconds.
-	if p.Created.Location() != time.UTC || p.Created.Nanosecond() != 0 {
-		t.Errorf("created = %s, want UTC with whole seconds", p.Created.Format(time.RFC3339Nano))
+	if opts.Created.Location() != time.UTC || opts.Created.Nanosecond() != 0 {
+		t.Errorf("created = %s, want UTC with whole seconds", opts.Created.Format(time.RFC3339Nano))
 	}
-	if p.Created.Before(before) || p.Created.After(after) {
-		t.Errorf("created = %s, want between %s and %s", p.Created, before, after)
+	if opts.Created.Before(before) || opts.Created.After(after) {
+		t.Errorf("created = %s, want between %s and %s", opts.Created, before, after)
 	}
-	if !p.Expires.IsZero() {
-		t.Errorf("expires = %s, want unset", p.Expires)
-	}
-}
-
-// MakeVerifiableDoc's only error is from json.Marshal of the document.
-func TestMakeVerifiableDoc_RejectsUnmarshalableDoc(t *testing.T) {
-	type cycle struct {
-		Self *cycle `json:"self"`
-	}
-	loop := &cycle{}
-	loop.Self = loop
-
-	tests := []struct {
-		name string
-		doc  any
-		want string
-	}{
-		{name: "channel", doc: make(chan int), want: "unsupported type: chan int"},
-		{name: "function", doc: func() {}, want: "unsupported type: func()"},
-		{name: "complex", doc: complex(1, 2), want: "unsupported type: complex128"},
-		{name: "map key", doc: map[struct{ N int }]string{{}: "x"}, want: "object member name must be a string"},
-		{name: "NaN", doc: math.NaN(), want: "unsupported value: NaN"},
-		{name: "+Inf", doc: math.Inf(1), want: "unsupported value: +Inf"},
-		{name: "cycle", doc: loop, want: "encountered a cycle"},
-		{name: "marshal error", doc: refuseJSON{}, want: "refuse to marshal"},
-		{name: "invalid raw JSON", doc: json.RawMessage(`{"id":`), want: "unexpected end of JSON input"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			vm := did.MustParseDIDURL(testKeyURL)
-			vd, err := MakeVerifiableDoc(tt.doc, CryptoSuiteECDSAJCS2019, &vm)
-			requireErrorContains(t, err, tt.want)
-			if vd.Body != nil || vd.Proof.ProofType != "" {
-				t.Errorf("MakeVerifiableDoc returned a partial doc with its error: %+v", vd)
-			}
-		})
+	if !opts.Expires.IsZero() {
+		t.Errorf("expires = %s, want unset", opts.Expires)
 	}
 }
 
@@ -625,30 +581,46 @@ func TestSign_RoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatalf("GenerateECDSASigner: %v", err)
 			}
-			vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
-			parsed := mustParseDoc(t, mustSign(t, &vd, signer))
+			signed := mustSign(t, sampleDoc(), testProofOptions(CryptoSuiteECDSAJCS2019), signer)
+			requireNoError(t, signed.Verify(signer.verifier()))
+			parsed := mustParseDoc(t, signed.Raw)
 			requireNoError(t, parsed.Verify(signer.verifier()))
 		})
 	}
 }
 
-// After a successful Sign, the doc holds the new proof and verifies as is.
-func TestSign_UpdatesDoc(t *testing.T) {
+// Sign assembles its result directly. It must match what ParseDoc makes of
+// the signed bytes: the same document, body and proof, and the same data to
+// sign, though the proof options may encode their fields in another order.
+func TestSign_MatchesParsedDoc(t *testing.T) {
 	signer := mustECDSASigner(t)
-	vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
-	signed := mustSign(t, &vd, signer)
+	signed := mustSign(t, sampleDoc(), testProofOptions(CryptoSuiteECDSAJCS2019), signer)
+	parsed := mustParseDoc(t, signed.Raw)
 
-	if len(vd.Proof.ProofValue) == 0 {
-		t.Error("ProofValue is empty after Sign")
+	if !bytes.Equal(signed.Raw, parsed.Raw) {
+		t.Errorf("Bytes = %s, ParseDoc gives %s", signed.Raw, parsed.Raw)
 	}
-	// Body gains the Data Integrity context, and is the signed document
-	// without its proof.
-	document, _ := signedFields(t, signed)
+	if !bytes.Equal(signed.Body, parsed.Body) {
+		t.Errorf("Body = %s, ParseDoc gives %s", signed.Body, parsed.Body)
+	}
+	if !reflect.DeepEqual(signed.Proof, parsed.Proof) {
+		t.Errorf("Proof = %+v, ParseDoc gives %+v", signed.Proof, parsed.Proof)
+	}
+	signedData, err := hashData(signed.Proof.CryptoSuite, signed.Body, signed.RawProofOptions, signer.hash)
+	requireNoError(t, err)
+	parsedData, err := hashData(parsed.Proof.CryptoSuite, parsed.Body, parsed.RawProofOptions, signer.hash)
+	requireNoError(t, err)
+	if !bytes.Equal(signedData, parsedData) {
+		t.Errorf("hash data = %x, ParseDoc gives %x", signedData, parsedData)
+	}
+
+	// Body is the signed document without its proof, including the Data
+	// Integrity context that Sign added.
+	document, _ := signedFields(t, signed.Raw)
 	delete(document, "proof")
-	if want := mustMarshal(t, document); !bytes.Equal(vd.Body, want) {
-		t.Errorf("Body = %s, want %s", vd.Body, want)
+	if want := mustMarshal(t, document); !bytes.Equal(signed.Body, want) {
+		t.Errorf("Body = %s, want %s", signed.Body, want)
 	}
-	requireNoError(t, vd.Verify(signer.verifier()))
 }
 
 func TestSign_AddsDataIntegrityContext(t *testing.T) {
@@ -678,8 +650,7 @@ func TestSign_AddsDataIntegrityContext(t *testing.T) {
 				doc["@context"] = tt.context
 			}
 			signer := mustECDSASigner(t)
-			vd := mustMakeVerifiableDoc(t, doc, CryptoSuiteECDSAJCS2019)
-			signed := mustSign(t, &vd, signer)
+			signed := mustSign(t, doc, testProofOptions(CryptoSuiteECDSAJCS2019), signer).Raw
 
 			document, proof := signedFields(t, signed)
 			requireRawField(t, document, "@context", tt.wantContext)
@@ -714,19 +685,19 @@ func TestSign_ProofTimestamps(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			signer := mustECDSASigner(t)
-			vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
-			vd.Proof.Created = tt.created
-			vd.Proof.Expires = tt.expires
-			signed := mustSign(t, &vd, signer)
+			opts := testProofOptions(CryptoSuiteECDSAJCS2019)
+			opts.Created = tt.created
+			opts.Expires = tt.expires
+			signed := mustSign(t, sampleDoc(), opts, signer).Raw
 
 			_, proof := signedFields(t, signed)
 			requireRawField(t, proof, "created", tt.wantCreated)
 			requireRawField(t, proof, "expires", tt.wantExpires)
 
 			parsed := mustParseDoc(t, signed)
-			if !parsed.Proof.Created.Equal(tt.created) || !parsed.Proof.Expires.Equal(tt.expires) {
+			if p := parsed.Proof; !p.Created.Equal(tt.created) || !p.Expires.Equal(tt.expires) {
 				t.Errorf("parsed created, expires = %s, %s; want %s, %s",
-					parsed.Proof.Created, parsed.Proof.Expires, tt.created, tt.expires)
+					p.Created, p.Expires, tt.created, tt.expires)
 			}
 			// Verify while the proof is valid. Some cases expired in the past.
 			requireNoError(t, parsed.VerifyAt(signer.verifier(), tt.created))
@@ -734,11 +705,11 @@ func TestSign_ProofTimestamps(t *testing.T) {
 	}
 }
 
-// A freshly made and signed doc writes created as whole-second UTC, such as
-// "2026-03-28T15:40:00Z", and leaves expires out.
+// A doc signed with NewProofOptions writes created as whole-second UTC, such
+// as "2026-03-28T15:40:00Z", and leaves expires out.
 func TestSign_DefaultTimestampFormat(t *testing.T) {
-	vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
-	_, proof := signedFields(t, mustSign(t, &vd, mustECDSASigner(t)))
+	signed := mustSign(t, sampleDoc(), testProofOptions(CryptoSuiteECDSAJCS2019), mustECDSASigner(t))
+	_, proof := signedFields(t, signed.Raw)
 
 	wholeSecondUTC := regexp.MustCompile(`^"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"$`)
 	if got := string(proof["created"]); !wholeSecondUTC.MatchString(got) {
@@ -768,8 +739,7 @@ func TestSign_RejectsSuiteMismatch(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			vd := mustMakeVerifiableDoc(t, sampleDoc(), tt.suite)
-			requireSignError(t, &vd, tt.signer, tt.want)
+			requireSignError(t, sampleDoc(), testProofOptions(tt.suite), tt.signer, tt.want)
 		})
 	}
 }
@@ -786,40 +756,70 @@ func TestSign_UnsupportedCryptoSuite(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.suite.String(), func(t *testing.T) {
 			t.Parallel()
-			vd := mustMakeVerifiableDoc(t, sampleDoc(), tt.suite)
-			requireSignError(t, &vd, tt.signer, "hashing document: unsupported cryptosuite "+tt.suite.String())
+			requireSignError(t, sampleDoc(), testProofOptions(tt.suite), tt.signer, "hashing document: unsupported cryptosuite "+tt.suite.String())
 		})
 	}
 }
 
-// Sign must refuse to produce a doc that ParseDoc would reject.
-func TestSign_RejectsInvalidProofConfig(t *testing.T) {
+// Sign must refuse to produce a doc that ParseDoc would reject. The proof
+// type and purpose are not options, so they are always valid.
+func TestSign_RejectsInvalidProofOptions(t *testing.T) {
 	tests := []struct {
 		name   string
-		mutate func(*Proof)
+		mutate func(*ProofOptions)
 		want   string
 	}{
-		{name: "wrong type", mutate: func(p *Proof) { p.ProofType = "Ed25519Signature2020" }, want: `unsupported proof type "Ed25519Signature2020"`},
-		{name: "empty type", mutate: func(p *Proof) { p.ProofType = "" }, want: `unsupported proof type ""`},
-		{name: "wrong purpose", mutate: func(p *Proof) { p.ProofPurpose = "authentication" }, want: `unsupported proof purpose "authentication"`},
-		{name: "empty purpose", mutate: func(p *Proof) { p.ProofPurpose = "" }, want: `unsupported proof purpose ""`},
-		{name: "no verification method", mutate: func(p *Proof) { p.VerificationMethod = nil }, want: "proof has no verificationMethod"},
-		{name: "expires at created", mutate: func(p *Proof) { p.Expires = p.Created }, want: "proof expires at or before it was created"},
-		{name: "expires before created", mutate: func(p *Proof) { p.Expires = p.Created.Add(-time.Second) }, want: "proof expires at or before it was created"},
+		{name: "no verification method", mutate: func(o *ProofOptions) { o.VerificationMethod = nil }, want: "proof has no verificationMethod"},
+		{name: "expires at created", mutate: func(o *ProofOptions) { o.Expires = o.Created }, want: "proof expires at or before it was created"},
+		{name: "expires before created", mutate: func(o *ProofOptions) { o.Expires = o.Created.Add(-time.Second) }, want: "proof expires at or before it was created"},
 	}
 	signer := mustECDSASigner(t)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
-			tt.mutate(&vd.Proof)
-			requireSignError(t, &vd, signer, tt.want)
+			opts := testProofOptions(CryptoSuiteECDSAJCS2019)
+			tt.mutate(&opts)
+			requireSignError(t, sampleDoc(), opts, signer, tt.want)
 		})
 	}
 }
 
-// MakeVerifiableDoc encodes any JSON value. Sign then needs an object, so it
-// can embed the proof.
+// A body that json.Marshal cannot encode is rejected before anything is signed.
+func TestSign_RejectsUnmarshalableBody(t *testing.T) {
+	type cycle struct {
+		Self *cycle `json:"self"`
+	}
+	loop := &cycle{}
+	loop.Self = loop
+
+	tests := []struct {
+		name string
+		doc  any
+		want string
+	}{
+		{name: "channel", doc: make(chan int), want: "unsupported type: chan int"},
+		{name: "function", doc: func() {}, want: "unsupported type: func()"},
+		{name: "complex", doc: complex(1, 2), want: "unsupported type: complex128"},
+		{name: "map key", doc: map[struct{ N int }]string{{}: "x"}, want: "object member name must be a string"},
+		{name: "NaN", doc: math.NaN(), want: "unsupported value: NaN"},
+		{name: "+Inf", doc: math.Inf(1), want: "unsupported value: +Inf"},
+		{name: "cycle", doc: loop, want: "encountered a cycle"},
+		{name: "marshal error", doc: refuseJSON{}, want: "refuse to marshal"},
+		{name: "empty raw JSON", doc: json.RawMessage{}, want: "unexpected end of JSON input"},
+		{name: "truncated raw JSON", doc: json.RawMessage(`{"id":`), want: "unexpected end of JSON input"},
+		{name: "raw JSON with trailing junk", doc: json.RawMessage(`{"id":1}x`), want: "invalid character 'x' after top-level value"},
+	}
+	signer := mustECDSASigner(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			requireSignError(t, tt.doc, testProofOptions(CryptoSuiteECDSAJCS2019), signer, "encoding document: ")
+			requireSignError(t, tt.doc, testProofOptions(CryptoSuiteECDSAJCS2019), signer, tt.want)
+		})
+	}
+}
+
+// Sign needs a body that encodes to an object, so it can embed the proof.
 func TestSign_RejectsNonObjectBody(t *testing.T) {
 	var nilPtr *struct{ ID int }
 	tests := []struct {
@@ -831,17 +831,19 @@ func TestSign_RejectsNonObjectBody(t *testing.T) {
 		{name: "nil pointer", doc: nilPtr, want: "document is null"},
 		{name: "nil slice", doc: []int(nil), want: "document is null"},
 		{name: "raw null", doc: json.RawMessage(`null`), want: "document is null"},
+		{name: "nil raw JSON", doc: json.RawMessage(nil), want: "document is null"},
 		{name: "number", doc: 101, want: "parsing document: json: cannot unmarshal number"},
 		{name: "string", doc: "Alice", want: "parsing document: json: cannot unmarshal string"},
 		{name: "bool", doc: true, want: "parsing document: json: cannot unmarshal bool"},
 		{name: "array", doc: []int{1, 2}, want: "parsing document: json: cannot unmarshal array"},
+		// A []byte encodes as a base64 string. JSON must be a json.RawMessage.
+		{name: "JSON as []byte", doc: []byte(`{"id":1}`), want: "parsing document: json: cannot unmarshal string"},
 	}
 	signer := mustECDSASigner(t)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			vd := mustMakeVerifiableDoc(t, tt.doc, CryptoSuiteECDSAJCS2019)
-			requireSignError(t, &vd, signer, tt.want)
+			requireSignError(t, tt.doc, testProofOptions(CryptoSuiteECDSAJCS2019), signer, tt.want)
 		})
 	}
 }
@@ -862,31 +864,7 @@ func TestSign_RejectsUncanonicalizableBody(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			vd := mustMakeVerifiableDoc(t, json.RawMessage(tt.raw), CryptoSuiteECDSAJCS2019)
-			requireSignError(t, &vd, signer, "parsing document: "+tt.want)
-		})
-	}
-}
-
-// A Body set by hand that is not JSON fails before anything is signed.
-func TestSign_RejectsInvalidBody(t *testing.T) {
-	tests := []struct {
-		name string
-		body []byte
-		want string
-	}{
-		{name: "nil", body: nil, want: "No JSON data provided"},
-		{name: "empty", body: []byte{}, want: "Unexpected EOF reached"},
-		{name: "truncated", body: []byte(`{"id":`), want: "Unexpected EOF reached"},
-		{name: "trailing junk", body: []byte(`{"id":1}x`), want: "Improperly terminated JSON object"},
-	}
-	signer := mustECDSASigner(t)
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
-			vd.Body = tt.body
-			requireSignError(t, &vd, signer, "parsing document: "+tt.want)
+			requireSignError(t, json.RawMessage(tt.raw), testProofOptions(CryptoSuiteECDSAJCS2019), signer, "parsing document: "+tt.want)
 		})
 	}
 }
@@ -904,6 +882,7 @@ func TestSign_InvalidSigner(t *testing.T) {
 		signer Signer
 		want   string
 	}{
+		{name: "nil", signer: nil, want: "no signer given"},
 		{name: "zero scalar", signer: withScalar(big.NewInt(0)), want: "signing document: signing: ecdsa: private key scalar is zero or negative"},
 		{name: "negative scalar", signer: withScalar(big.NewInt(-1)), want: "signing document: signing: ecdsa: private key scalar is zero or negative"},
 		{name: "scalar too large", signer: withScalar(new(big.Int).Lsh(big.NewInt(1), 256)), want: "signing document: signing: ecdsa: private key scalar too large"},
@@ -912,8 +891,7 @@ func TestSign_InvalidSigner(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
-			requireSignError(t, &vd, tt.signer, tt.want)
+			requireSignError(t, sampleDoc(), testProofOptions(CryptoSuiteECDSAJCS2019), tt.signer, tt.want)
 		})
 	}
 }
@@ -922,22 +900,107 @@ func TestSign_InvalidSigner(t *testing.T) {
 // body and then overwrite it, giving a doc that can never verify.
 func TestSign_RejectsBodyWithProof(t *testing.T) {
 	doc := map[string]any{"id": 101, "proof": map[string]any{"type": "DataIntegrityProof"}}
-	vd := mustMakeVerifiableDoc(t, doc, CryptoSuiteECDSAJCS2019)
-	requireSignError(t, &vd, mustECDSASigner(t), "document already has a proof")
+	requireSignError(t, doc, testProofOptions(CryptoSuiteECDSAJCS2019), mustECDSASigner(t), "document already has a proof")
 }
 
-// Sign must not overwrite an existing signature, whether the doc was signed
-// here or parsed from a signed document.
+// A SignedDoc encodes with its proof, so it cannot be signed again, whether it
+// was signed here or parsed from a signed document.
 func TestSign_RejectsSignedDoc(t *testing.T) {
 	signer := mustECDSASigner(t)
-	signedHere := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
-	parsed := mustParseDoc(t, mustSign(t, &signedHere, signer))
+	opts := testProofOptions(CryptoSuiteECDSAJCS2019)
+	signedHere := mustSign(t, sampleDoc(), opts, signer)
+	parsed := mustParseDoc(t, signedHere.Raw)
 
-	for name, vd := range map[string]VerifiableDoc{"signed here": signedHere, "parsed": parsed} {
+	for name, vd := range map[string]SignedDoc{"signed here": signedHere, "parsed": parsed} {
 		t.Run(name, func(t *testing.T) {
-			requireSignError(t, &vd, signer, "document is already signed")
+			requireSignError(t, vd, opts, signer, "document already has a proof")
 		})
 	}
+}
+
+// --- SignedDoc ---
+
+// A doc with fields that neither this package nor the caller's type models
+// still verifies, and Bytes returns it exactly as it was received.
+func TestSignedDoc_UnknownFields(t *testing.T) {
+	signer := mustECDSASigner(t)
+	// The sender's type has fields the receiver's type does not.
+	doc := map[string]any{
+		"id":       101,
+		"name":     "Alice",
+		"nickname": "Al",
+		"joined":   "2026-10-06T15:06:41.070240+08:00",
+		"empty":    "",
+		"tags":     []string{},
+	}
+	signed := mustSign(t, doc, testProofOptions(CryptoSuiteECDSAJCS2019), signer)
+	// Add the whitespace and key order of another encoder.
+	var indented bytes.Buffer
+	if err := json.Indent(&indented, signed.Raw, "", "  "); err != nil {
+		t.Fatalf("json.Indent: %v", err)
+	}
+	received := indented.Bytes()
+
+	parsed := mustParseDoc(t, received)
+	if !bytes.Equal(parsed.Raw, received) {
+		t.Errorf("Bytes = %s, want the received document %s", parsed.Raw, received)
+	}
+
+	var person struct {
+		ID     int       `json:"id"`
+		Name   string    `json:"name"`
+		Joined time.Time `json:"joined"`
+		Empty  string    `json:"empty,omitempty"`
+		Tags   []string  `json:"tags"`
+	}
+	requireNoError(t, parsed.DecodeBody(&person))
+	if person.ID != 101 || person.Name != "Alice" {
+		t.Errorf("decoded body = %+v", person)
+	}
+	// Re-encoding the view gives a different document...
+	if reencoded := mustMarshal(t, person); bytes.Equal(reencoded, parsed.Body) {
+		t.Fatalf("test setup: re-encoded body %s is unchanged", reencoded)
+	}
+	// ...but the doc verifies, because it never re-encodes.
+	requireNoError(t, parsed.Verify(signer.verifier()))
+}
+
+func TestSignedDoc_ZeroValue(t *testing.T) {
+	var vd SignedDoc
+	requireErrorContains(t, vd.Verify(mustECDSASigner(t).verifier()), "empty document")
+	if got := mustMarshal(t, vd); string(got) != "null" {
+		t.Errorf("json.Marshal = %s, want null", got)
+	}
+}
+
+// A SignedDoc can be a field of another JSON value. It encodes as the signed
+// document and decodes with ParseDoc.
+func TestSignedDoc_JSONField(t *testing.T) {
+	type envelope struct {
+		Note string    `json:"note"`
+		Doc  SignedDoc `json:"doc"`
+	}
+	signer := mustECDSASigner(t)
+	sent := envelope{Note: "hello", Doc: mustSign(t, sampleDoc(), testProofOptions(CryptoSuiteECDSAJCS2019), signer)}
+
+	var received envelope
+	mustUnmarshal(t, mustMarshal(t, sent), &received)
+	if received.Note != "hello" {
+		t.Errorf("note = %q, want %q", received.Note, "hello")
+	}
+	requireNoError(t, received.Doc.Verify(signer.verifier()))
+
+	t.Run("null", func(t *testing.T) {
+		var got envelope
+		mustUnmarshal(t, []byte(`{"note":"hello","doc":null}`), &got)
+		if !reflect.DeepEqual(got.Doc, SignedDoc{}) {
+			t.Errorf("doc = %+v, want the zero SignedDoc", got.Doc)
+		}
+	})
+	t.Run("invalid doc", func(t *testing.T) {
+		err := json.Unmarshal([]byte(`{"doc":{"id":1}}`), &envelope{})
+		requireErrorContains(t, err, "document has no proof")
+	})
 }
 
 // --- Verify ---
@@ -1065,15 +1128,14 @@ func TestSignAndVerifyWithDID(t *testing.T) {
 	published := &did.Document{Context: []any{did.DIDContextV1URI()}, ID: keyURL.DID}
 	published.AddAssertionMethod(vm)
 
-	vd := mustMakeVerifiableDoc(t, sampleDoc(), CryptoSuiteECDSAJCS2019)
-	signed := mustSign(t, &vd, signer)
+	signed := mustSign(t, sampleDoc(), NewProofOptions(CryptoSuiteECDSAJCS2019, &keyURL), signer)
 
 	// The verifier receives both documents as JSON.
 	didDoc, err := did.ParseDocument(string(mustMarshal(t, published)))
 	if err != nil {
 		t.Fatalf("did.ParseDocument: %v", err)
 	}
-	received := mustParseDoc(t, signed)
+	received := mustParseDoc(t, signed.Raw)
 	verifier, err := GetAssertionVerifier(didDoc, received.Proof.VerificationMethod)
 	if err != nil {
 		t.Fatalf("GetAssertionVerifier: %v", err)

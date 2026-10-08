@@ -118,11 +118,11 @@ var vectorEd25519 = w3cVector{
 
 var w3cVectors = []w3cVector{vectorP256, vectorP384, vectorEd25519}
 
-// vectorDoc splits a vector's signed credential into a VerifiableDoc the way
+// vectorDoc splits a vector's signed credential into a SignedDoc the way
 // ParseDoc does, but without ParseDoc's checks. ParseDoc rejects the vectors
 // because their proofs carry an @context, and this lets them still test
 // hashing and verification.
-func vectorDoc(t *testing.T, v w3cVector) VerifiableDoc {
+func vectorDoc(t *testing.T, v w3cVector) SignedDoc {
 	t.Helper()
 	var document map[string]json.RawMessage
 	mustUnmarshal(t, []byte(v.signed()), &document)
@@ -135,5 +135,5 @@ func vectorDoc(t *testing.T, v w3cVector) VerifiableDoc {
 	mustUnmarshal(t, rawProof, &options)
 	delete(options, "proofValue")
 
-	return VerifiableDoc{Body: mustMarshal(t, document), Proof: proof, rawProofOptions: mustMarshal(t, options)}
+	return SignedDoc{Raw: []byte(v.signed()), Body: mustMarshal(t, document), RawProofOptions: mustMarshal(t, options), Proof: proof}
 }

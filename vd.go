@@ -1,6 +1,7 @@
 package verifdocs
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -106,9 +107,29 @@ func (cs CryptoSuiteType) MatchesSigType(sigType SigType) bool {
 	return false
 }
 
-// Proof is a Data Integrity proof. Without a ProofValue it is the proof
-// configuration that Sign completes. A proof never has its own @context; the
-// document's @context applies to it.
+// ProofOptions are the choices a signer makes for a new proof. A zero Created
+// or Expires leaves that field out of the proof.
+type ProofOptions struct {
+	CryptoSuite        CryptoSuiteType
+	VerificationMethod *did.DIDURL
+	Created            time.Time
+	Expires            time.Time
+}
+
+// NewProofOptions returns options for a proof made with cs by the key that vm
+// names, created now. Nothing checks that vm names the key that will sign;
+// that is up to the caller.
+func NewProofOptions(cs CryptoSuiteType, vm *did.DIDURL) ProofOptions {
+	return ProofOptions{
+		CryptoSuite:        cs,
+		VerificationMethod: vm,
+		// UTC with whole seconds, the plainest form of an XML Schema dateTimeStamp.
+		Created: time.Now().UTC().Truncate(time.Second),
+	}
+}
+
+// Proof is a Data Integrity proof, as found in a SignedDoc. A proof never has
+// its own @context; the document's @context applies to it.
 type Proof struct {
 	ProofType          string          `json:"type"`
 	ProofPurpose       string          `json:"proofPurpose"`
@@ -119,15 +140,28 @@ type Proof struct {
 	Expires            time.Time       `json:"expires,omitzero"`
 }
 
-// VerifiableDoc is a document body and the Data Integrity proof over it.
-type VerifiableDoc struct {
-	// Body is the document as JSON, without its proof.
-	Body  []byte
+// SignedDoc is a JSON document secured with a Data Integrity proof. Make one
+// with ParseDoc or Sign.
+//
+// Verify checks Body and RawProofOptions as they are, never a re-encoding,
+// so fields that this package or the caller's types do not model are still
+// covered by the signature. To change a document, decode Body, edit it,
+// and sign it again; changing the fields of a SignedDoc gives one that does
+// not verify, or whose Proof does not describe what was signed.
+//
+// The zero value is an empty document that does not verify.
+type SignedDoc struct {
+	// Raw is the document with its proof, exactly as parsed or signed. Send
+	// these bytes, rather than a re-encoding of a decoded body, so that the
+	// document still verifies.
+	Raw []byte
+	// Body is the document without its proof, as JSON. See DecodeBody.
+	Body []byte
+	// RawProofOptions is the proof without its proofValue, as JSON. It
+	// includes proof fields that Proof does not model.
+	RawProofOptions []byte
+	// Proof is the proof, parsed.
 	Proof Proof
-	// rawProofOptions is the proof as JSON, without its proofValue. It is
-	// hashed as is, so proof fields this package does not model are still
-	// covered by the signature.
-	rawProofOptions []byte
 }
 
 // ParseDoc parses a JSON document secured with a Data Integrity proof. It
@@ -136,55 +170,88 @@ type VerifiableDoc struct {
 //
 // The proof must be a DataIntegrityProof for assertionMethod, and must not
 // have its own @context.
-func ParseDoc(data []byte) (VerifiableDoc, error) {
+//
+// The returned doc's Raw is data itself, not a copy.
+func ParseDoc(data []byte) (SignedDoc, error) {
 	// encoding/json silently keeps the last of two duplicate keys, while other
 	// parsers may keep the first. JCS rejects duplicates at any depth, so a
 	// verified doc cannot be read two different ways.
 	if _, err := jcs.Transform(data); err != nil {
-		return VerifiableDoc{}, fmt.Errorf("parsing document: %w", err)
+		return SignedDoc{}, fmt.Errorf("parsing document: %w", err)
 	}
 
 	var document map[string]json.RawMessage
 	if err := json.Unmarshal(data, &document); err != nil {
-		return VerifiableDoc{}, fmt.Errorf("parsing document: %w", err)
+		return SignedDoc{}, fmt.Errorf("parsing document: %w", err)
 	}
 	rawProof, ok := document["proof"]
 	if !ok {
-		return VerifiableDoc{}, errors.New("document has no proof")
+		return SignedDoc{}, errors.New("document has no proof")
 	}
 	delete(document, "proof")
 
 	var proof Proof
 	if err := json.Unmarshal(rawProof, &proof); err != nil {
-		return VerifiableDoc{}, fmt.Errorf("parsing proof: %w", err)
+		return SignedDoc{}, fmt.Errorf("parsing proof: %w", err)
 	}
 	if err := checkProofConfig(proof); err != nil {
-		return VerifiableDoc{}, err
+		return SignedDoc{}, err
 	}
 	if len(proof.ProofValue) == 0 {
-		return VerifiableDoc{}, errors.New("proof has no proofValue")
+		return SignedDoc{}, errors.New("proof has no proofValue")
 	}
 
 	// The proof options are every proof field except proofValue, including
 	// fields that Proof does not model.
 	var proofOptions map[string]json.RawMessage
 	if err := json.Unmarshal(rawProof, &proofOptions); err != nil {
-		return VerifiableDoc{}, fmt.Errorf("parsing proof: %w", err)
+		return SignedDoc{}, fmt.Errorf("parsing proof: %w", err)
 	}
 	if _, ok := proofOptions["@context"]; ok {
-		return VerifiableDoc{}, errors.New("proof must not have an @context")
+		return SignedDoc{}, errors.New("proof must not have an @context")
 	}
 	delete(proofOptions, "proofValue")
 
 	body, err := json.Marshal(document)
 	if err != nil {
-		return VerifiableDoc{}, fmt.Errorf("encoding document: %w", err)
+		return SignedDoc{}, fmt.Errorf("encoding document: %w", err)
 	}
 	options, err := json.Marshal(proofOptions)
 	if err != nil {
-		return VerifiableDoc{}, fmt.Errorf("encoding proof options: %w", err)
+		return SignedDoc{}, fmt.Errorf("encoding proof options: %w", err)
 	}
-	return VerifiableDoc{Body: body, Proof: proof, rawProofOptions: options}, nil
+	return SignedDoc{Raw: data, Body: body, RawProofOptions: options, Proof: proof}, nil
+}
+
+// DecodeBody decodes Body into v, as json.Unmarshal does. Fields that v does
+// not model are left out of v but are still covered by Verify, so re-encoding
+// v does not give back the signed document.
+func (d SignedDoc) DecodeBody(v any) error {
+	return json.Unmarshal(d.Body, v)
+}
+
+// MarshalJSON returns Raw, so a SignedDoc can be a field of another JSON
+// value. The zero SignedDoc marshals as null.
+func (d SignedDoc) MarshalJSON() ([]byte, error) {
+	if d.Raw == nil {
+		return []byte("null"), nil
+	}
+	return d.Raw, nil
+}
+
+// UnmarshalJSON parses data with ParseDoc. As is the convention, null leaves d
+// unchanged.
+func (d *SignedDoc) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		return nil
+	}
+	// encoding/json may reuse data after this returns.
+	parsed, err := ParseDoc(bytes.Clone(data))
+	if err != nil {
+		return err
+	}
+	*d = parsed
+	return nil
 }
 
 // checkProofConfig checks the proof fields that every proof must have before
@@ -225,14 +292,14 @@ func (p Proof) checkValidAt(at time.Time) error {
 	return nil
 }
 
-// hashData returns the data that the doc's cryptosuite signs, using hash as
-// the suite's hash function. Only the JCS suites are supported.
-func (vd VerifiableDoc) hashData(hash func([]byte) []byte) ([]byte, error) {
-	switch vd.Proof.CryptoSuite {
+// hashData returns the data that cs signs for a body and proof options, using
+// hash as the suite's hash function. Only the JCS suites are supported.
+func hashData(cs CryptoSuiteType, body, proofOptions []byte, hash func([]byte) []byte) ([]byte, error) {
+	switch cs {
 	case CryptoSuiteECDSAJCS2019, CryptoSuiteEDDSAJCS2022:
-		return jcsHashData(vd.Body, vd.rawProofOptions, hash)
+		return jcsHashData(body, proofOptions, hash)
 	default:
-		return nil, fmt.Errorf("unsupported cryptosuite %s", vd.Proof.CryptoSuite)
+		return nil, fmt.Errorf("unsupported cryptosuite %s", cs)
 	}
 }
 
@@ -253,13 +320,14 @@ func jcsHashData(body, proofOptions []byte, hash func([]byte) []byte) ([]byte, e
 }
 
 // Verify checks the doc's proof as of the current time. See VerifyAt.
-func (vd VerifiableDoc) Verify(verifier SigVerifier) error {
-	return vd.VerifyAt(verifier, time.Now())
+func (d SignedDoc) Verify(verifier SigVerifier) error {
+	return d.VerifyAt(verifier, time.Now())
 }
 
 // VerifyAt checks the doc's proof as of the time at. It returns nil only if
 // the signature is valid and at falls within the proof's created and expires
-// times.
+// times. The signature is checked first, so the times are only trusted once
+// they are known to be signed.
 //
 // A signature that does not verify returns an error wrapping
 // ErrInvalidSignature. A proof that is not valid at that time returns an
@@ -270,21 +338,21 @@ func (vd VerifiableDoc) Verify(verifier SigVerifier) error {
 // The caller is responsible for choosing the verifier, normally with
 // GetAssertionVerifier, and for checking that the key belongs to the
 // expected signer.
-func (vd VerifiableDoc) VerifyAt(verifier SigVerifier, at time.Time) error {
+func (d SignedDoc) VerifyAt(verifier SigVerifier, at time.Time) error {
 	if verifier == nil {
 		return errors.New("no verifier given")
 	}
-	if !vd.Proof.CryptoSuite.MatchesSigType(verifier.sigType()) {
-		return fmt.Errorf("verifier type %s does not match cryptosuite %s", verifier.sigType(), vd.Proof.CryptoSuite)
+	if d.Body == nil {
+		return errors.New("empty document")
 	}
-	if err := vd.Proof.checkValidAt(at); err != nil {
-		return err
+	if !d.Proof.CryptoSuite.MatchesSigType(verifier.sigType()) {
+		return fmt.Errorf("verifier type %s does not match cryptosuite %s", verifier.sigType(), d.Proof.CryptoSuite)
 	}
-	data, err := vd.hashData(verifier.hash)
+	data, err := hashData(d.Proof.CryptoSuite, d.Body, d.RawProofOptions, verifier.hash)
 	if err != nil {
 		return fmt.Errorf("hashing document: %w", err)
 	}
-	ok, err := verifier.verify(data, vd.Proof.ProofValue)
+	ok, err := verifier.verify(data, d.Proof.ProofValue)
 	if err != nil {
 		// The signature is malformed, for example the wrong length.
 		return fmt.Errorf("%w: %w", ErrInvalidSignature, err)
@@ -292,97 +360,94 @@ func (vd VerifiableDoc) VerifyAt(verifier SigVerifier, at time.Time) error {
 	if !ok {
 		return ErrInvalidSignature
 	}
-	return nil
+	return d.Proof.checkValidAt(at)
 }
 
-// MakeVerifiableDoc encodes doc as JSON and prepares an assertionMethod proof
-// for it, created now, ready for Sign. Nothing checks that vm names the key
-// that will sign it; that is up to the caller.
-func MakeVerifiableDoc(doc any, cs CryptoSuiteType, vm *did.DIDURL) (VerifiableDoc, error) {
-	body, err := json.Marshal(doc)
-	if err != nil {
-		return VerifiableDoc{}, err
+// Sign encodes body as JSON, adds DataIntegrityContext to its @context, and
+// signs it with a proof made from opts. body must encode to a JSON object
+// that has no proof. To sign JSON that is already encoded, pass it as a
+// json.RawMessage; a plain []byte encodes as a base64 string.
+//
+// Before returning, Sign checks the new signature with the signer's public
+// key, so the result is known to verify.
+func Sign(body any, opts ProofOptions, signer Signer) (SignedDoc, error) {
+	if signer == nil {
+		return SignedDoc{}, errors.New("no signer given")
 	}
-	return VerifiableDoc{
-		Body: body,
-		Proof: Proof{
-			ProofType:          proofType,
-			ProofPurpose:       proofPurpose,
-			CryptoSuite:        cs,
-			VerificationMethod: vm,
-			// UTC with whole seconds, the plainest form of an XML Schema dateTimeStamp.
-			Created: time.Now().UTC().Truncate(time.Second),
-		},
-	}, nil
-}
+	if cs := opts.CryptoSuite; !cs.MatchesSigType(signer.sigType()) {
+		return SignedDoc{}, fmt.Errorf("signer type %s does not match cryptosuite %s", signer.sigType(), cs)
+	}
+	proof := Proof{
+		ProofType:          proofType,
+		ProofPurpose:       proofPurpose,
+		CryptoSuite:        opts.CryptoSuite,
+		VerificationMethod: opts.VerificationMethod,
+		Created:            opts.Created,
+		Expires:            opts.Expires,
+	}
+	// Refuse to sign a proof that ParseDoc would reject.
+	if err := checkProofConfig(proof); err != nil {
+		return SignedDoc{}, err
+	}
 
-// Sign signs the doc and returns it as JSON with the proof embedded. It first
-// adds DataIntegrityContext to the document's @context, so Body changes too.
-// On success vd holds the new proof value and can be verified directly.
-// A doc that is already signed cannot be signed again.
-func (vd *VerifiableDoc) Sign(signer Signer) ([]byte, error) {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return SignedDoc{}, fmt.Errorf("encoding document: %w", err)
+	}
 	// Re-encoding the map below would silently drop duplicate keys. JCS
 	// rejects them, as ParseDoc does, along with anything else it cannot
 	// canonicalize.
-	if _, err := jcs.Transform(vd.Body); err != nil {
-		return nil, fmt.Errorf("parsing document: %w", err)
+	if _, err := jcs.Transform(data); err != nil {
+		return SignedDoc{}, fmt.Errorf("parsing document: %w", err)
 	}
-	if cs := vd.Proof.CryptoSuite; !cs.MatchesSigType(signer.sigType()) {
-		return nil, fmt.Errorf("signer type %s does not match cryptosuite %s", signer.sigType(), cs)
-	}
-	// Refuse to sign a proof that ParseDoc would reject.
-	if err := checkProofConfig(vd.Proof); err != nil {
-		return nil, err
-	}
-	if len(vd.Proof.ProofValue) > 0 {
-		return nil, errors.New("document is already signed")
-	}
-
 	var document map[string]json.RawMessage
-	if err := json.Unmarshal(vd.Body, &document); err != nil {
-		return nil, fmt.Errorf("parsing document: %w", err)
+	if err := json.Unmarshal(data, &document); err != nil {
+		return SignedDoc{}, fmt.Errorf("parsing document: %w", err)
 	}
 	// JSON null unmarshals without error and leaves the map nil.
 	if document == nil {
-		return nil, errors.New("document is null")
+		return SignedDoc{}, errors.New("document is null")
 	}
 	// The old proof would be hashed as part of the body and then replaced,
 	// giving a doc that can never verify. Proof sets are not supported.
 	if _, ok := document["proof"]; ok {
-		return nil, errors.New("document already has a proof")
+		return SignedDoc{}, errors.New("document already has a proof")
 	}
 
 	// Add the Data Integrity context, so the proof's terms are defined.
 	context, err := withDataIntegrityContext(document["@context"])
 	if err != nil {
-		return nil, fmt.Errorf("parsing document @context: %w", err)
+		return SignedDoc{}, fmt.Errorf("parsing document @context: %w", err)
 	}
 	document["@context"] = context
-	if vd.Body, err = json.Marshal(document); err != nil {
-		return nil, fmt.Errorf("encoding document: %w", err)
-	}
 
 	// Hash the body and the proof options, then sign.
-	if vd.rawProofOptions, err = json.Marshal(vd.Proof); err != nil {
-		return nil, fmt.Errorf("encoding proof options: %w", err)
-	}
-	data, err := vd.hashData(signer.hash)
+	unsignedBody, err := json.Marshal(document)
 	if err != nil {
-		return nil, fmt.Errorf("hashing document: %w", err)
+		return SignedDoc{}, fmt.Errorf("encoding document: %w", err)
 	}
-	if vd.Proof.ProofValue, err = signer.sign(data); err != nil {
-		return nil, fmt.Errorf("signing document: %w", err)
+	options, err := json.Marshal(proof)
+	if err != nil {
+		return SignedDoc{}, fmt.Errorf("encoding proof options: %w", err)
+	}
+	hashed, err := hashData(proof.CryptoSuite, unsignedBody, options, signer.hash)
+	if err != nil {
+		return SignedDoc{}, fmt.Errorf("hashing document: %w", err)
+	}
+	if proof.ProofValue, err = signer.sign(hashed); err != nil {
+		return SignedDoc{}, fmt.Errorf("signing document: %w", err)
 	}
 
-	// Assemble the signed doc by embedding the proof in it.
-	if document["proof"], err = json.Marshal(vd.Proof); err != nil {
-		return nil, fmt.Errorf("encoding proof: %w", err)
+	// Embed the proof in the document.
+	if document["proof"], err = json.Marshal(proof); err != nil {
+		return SignedDoc{}, fmt.Errorf("encoding proof: %w", err)
 	}
 	signed, err := json.Marshal(document)
 	if err != nil {
-		return nil, fmt.Errorf("encoding signed document: %w", err)
+		return SignedDoc{}, fmt.Errorf("encoding signed document: %w", err)
 	}
-	return signed, nil
+
+	return SignedDoc{Raw: signed, Body: unsignedBody, RawProofOptions: options, Proof: proof}, nil
 }
 
 // withDataIntegrityContext returns an @context value that includes
