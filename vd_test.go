@@ -68,7 +68,7 @@ func signedTestDoc(t *testing.T, doc any, created, expires time.Time) (SignedDoc
 	opts := testProofOptions(CryptoSuiteECDSAJCS2019)
 	opts.Created = created
 	opts.Expires = expires
-	return mustParseDoc(t, mustSign(t, doc, opts, signer).Raw), signer.verifier()
+	return mustParseDoc(t, mustSign(t, doc, opts, signer).Raw), signer.Verifier()
 }
 
 func requireParseDocError(t *testing.T, doc string, want string) {
@@ -134,16 +134,16 @@ type stubSigner struct {
 	signErr error
 }
 
-func (s stubSigner) sign([]byte) ([]byte, error) {
+func (s stubSigner) Sign([]byte) ([]byte, error) {
 	if s.signErr != nil {
 		return nil, s.signErr
 	}
 	return []byte{0x01}, nil
 }
 
-func (s stubSigner) sigType() SigType        { return s.kind }
-func (s stubSigner) hash(data []byte) []byte { return data }
-func (s stubSigner) verifier() SigVerifier   { return nil }
+func (s stubSigner) SigType() SigType        { return s.kind }
+func (s stubSigner) Hash(data []byte) []byte { return data }
+func (s stubSigner) Verifier() SigVerifier   { return nil }
 
 // refuseJSON is a document whose MarshalJSON method fails.
 type refuseJSON struct{}
@@ -232,7 +232,7 @@ func TestW3CVectors_HashData(t *testing.T) {
 		t.Run(vec.name, func(t *testing.T) {
 			t.Parallel()
 			vd := vectorDoc(t, vec)
-			got, err := hashData(vd.Proof.CryptoSuite, vd.Body, vd.RawProofOptions, mustVerifier(t, vec.publicKey).hash)
+			got, err := hashData(vd.Proof.CryptoSuite, vd.Body, vd.RawProofOptions, mustVerifier(t, vec.publicKey).Hash)
 			if err != nil {
 				t.Fatalf("hashData: %v", err)
 			}
@@ -650,9 +650,9 @@ func TestSign_RoundTrip(t *testing.T) {
 				t.Fatalf("GenerateECDSASigner: %v", err)
 			}
 			signed := mustSign(t, sampleDoc(), testProofOptions(CryptoSuiteECDSAJCS2019), signer)
-			requireNoError(t, signed.Verify(signer.verifier()))
+			requireNoError(t, signed.Verify(signer.Verifier()))
 			parsed := mustParseDoc(t, signed.Raw)
-			requireNoError(t, parsed.Verify(signer.verifier()))
+			requireNoError(t, parsed.Verify(signer.Verifier()))
 		})
 	}
 }
@@ -674,9 +674,9 @@ func TestSign_MatchesParsedDoc(t *testing.T) {
 	if !reflect.DeepEqual(signed.Proof, parsed.Proof) {
 		t.Errorf("Proof = %+v, ParseDoc gives %+v", signed.Proof, parsed.Proof)
 	}
-	signedData, err := hashData(signed.Proof.CryptoSuite, signed.Body, signed.RawProofOptions, signer.hash)
+	signedData, err := hashData(signed.Proof.CryptoSuite, signed.Body, signed.RawProofOptions, signer.Hash)
 	requireNoError(t, err)
-	parsedData, err := hashData(parsed.Proof.CryptoSuite, parsed.Body, parsed.RawProofOptions, signer.hash)
+	parsedData, err := hashData(parsed.Proof.CryptoSuite, parsed.Body, parsed.RawProofOptions, signer.Hash)
 	requireNoError(t, err)
 	if !bytes.Equal(signedData, parsedData) {
 		t.Errorf("hash data = %x, ParseDoc gives %x", signedData, parsedData)
@@ -734,7 +734,7 @@ func TestSign_Context(t *testing.T) {
 				t.Errorf("Proof.Context = %s, want %s", got, tt.wantContext)
 			}
 
-			requireNoError(t, mustParseDoc(t, signed.Raw).Verify(signer.verifier()))
+			requireNoError(t, mustParseDoc(t, signed.Raw).Verify(signer.Verifier()))
 		})
 	}
 }
@@ -778,7 +778,7 @@ func TestSign_ProofTimestamps(t *testing.T) {
 					p.Created, p.Expires, tt.created, tt.expires)
 			}
 			// Verify while the proof is valid. Some cases expired in the past.
-			requireNoError(t, parsed.VerifyAt(signer.verifier(), tt.created))
+			requireNoError(t, parsed.VerifyAt(signer.Verifier(), tt.created))
 		})
 	}
 }
@@ -1040,12 +1040,12 @@ func TestSignedDoc_UnknownFields(t *testing.T) {
 		t.Fatalf("test setup: re-encoded body %s is unchanged", reencoded)
 	}
 	// ...but the doc verifies, because it never re-encodes.
-	requireNoError(t, parsed.Verify(signer.verifier()))
+	requireNoError(t, parsed.Verify(signer.Verifier()))
 }
 
 func TestSignedDoc_ZeroValue(t *testing.T) {
 	var vd SignedDoc
-	requireErrorContains(t, vd.Verify(mustECDSASigner(t).verifier()), "empty document")
+	requireErrorContains(t, vd.Verify(mustECDSASigner(t).Verifier()), "empty document")
 	if got := mustMarshal(t, vd); string(got) != "null" {
 		t.Errorf("json.Marshal = %s, want null", got)
 	}
@@ -1066,7 +1066,7 @@ func TestSignedDoc_JSONField(t *testing.T) {
 	if received.Note != "hello" {
 		t.Errorf("note = %q, want %q", received.Note, "hello")
 	}
-	requireNoError(t, received.Doc.Verify(signer.verifier()))
+	requireNoError(t, received.Doc.Verify(signer.Verifier()))
 
 	t.Run("null", func(t *testing.T) {
 		var got envelope

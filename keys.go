@@ -40,21 +40,21 @@ func (t SigType) String() string {
 // SigVerifier checks signatures made with one public key. Use
 // GetAssertionVerifier, VerifierFromMultikey or VerifierFromJWK to make one.
 type SigVerifier interface {
-	// verify reports whether sig is a valid signature over data.
-	verify(data []byte, sig []byte) (bool, error)
-	sigType() SigType
-	// hash is the cryptosuite's hash function for this key.
-	hash(data []byte) []byte
+	// Verify reports whether sig is a valid signature over data.
+	Verify(data []byte, sig []byte) (bool, error)
+	SigType() SigType
+	// Hash is the cryptosuite's hash function for this key.
+	Hash(data []byte) []byte
 }
 
 // Signer signs with one private key.
 type Signer interface {
-	// sign returns a signature over data.
-	sign(data []byte) ([]byte, error)
-	sigType() SigType
-	// hash is the cryptosuite's hash function for this key.
-	hash(data []byte) []byte
-	verifier() SigVerifier
+	// Sign returns a signature over data.
+	Sign(data []byte) ([]byte, error)
+	SigType() SigType
+	// Hash is the cryptosuite's hash function for this key.
+	Hash(data []byte) []byte
+	Verifier() SigVerifier
 }
 
 // fieldBytes returns the size in bytes of a coordinate on curve. P-521 needs
@@ -84,23 +84,23 @@ type ECDSAVerifier struct {
 	pubKey *ecdsa.PublicKey
 }
 
-// verify checks an IEEE P1363 signature: r followed by s, each the size of a
+// Verify checks an IEEE P1363 signature: r followed by s, each the size of a
 // curve coordinate.
-func (v ECDSAVerifier) verify(data []byte, sig []byte) (bool, error) {
+func (v ECDSAVerifier) Verify(data []byte, sig []byte) (bool, error) {
 	size := fieldBytes(v.pubKey.Curve)
 	if len(sig) != 2*size {
 		return false, fmt.Errorf("wrong signature size: got %d bytes, want %d", len(sig), 2*size)
 	}
 	r := new(big.Int).SetBytes(sig[:size])
 	s := new(big.Int).SetBytes(sig[size:])
-	return ecdsa.Verify(v.pubKey, v.hash(data), r, s), nil
+	return ecdsa.Verify(v.pubKey, v.Hash(data), r, s), nil
 }
 
-func (v ECDSAVerifier) hash(data []byte) []byte {
+func (v ECDSAVerifier) Hash(data []byte) []byte {
 	return hashForCurve(v.pubKey.Curve, data)
 }
 
-func (v ECDSAVerifier) sigType() SigType {
+func (v ECDSAVerifier) SigType() SigType {
 	return SigTypeECDSA
 }
 
@@ -118,10 +118,10 @@ func GenerateECDSASigner(curve elliptic.Curve) (*ECDSASigner, error) {
 	return &ECDSASigner{signKey: *key}, nil
 }
 
-// sign returns an IEEE P1363 signature, r followed by s, as the ECDSA
+// Sign returns an IEEE P1363 signature, r followed by s, as the ECDSA
 // cryptosuites require.
-func (signer ECDSASigner) sign(data []byte) ([]byte, error) {
-	r, s, err := ecdsa.Sign(rand.Reader, &signer.signKey, signer.hash(data))
+func (signer ECDSASigner) Sign(data []byte) ([]byte, error) {
+	r, s, err := ecdsa.Sign(rand.Reader, &signer.signKey, signer.Hash(data))
 	if err != nil {
 		return nil, fmt.Errorf("signing: %w", err)
 	}
@@ -132,15 +132,15 @@ func (signer ECDSASigner) sign(data []byte) ([]byte, error) {
 	return sig, nil
 }
 
-func (signer ECDSASigner) hash(data []byte) []byte {
+func (signer ECDSASigner) Hash(data []byte) []byte {
 	return hashForCurve(signer.signKey.Curve, data)
 }
 
-func (signer ECDSASigner) sigType() SigType {
+func (signer ECDSASigner) SigType() SigType {
 	return SigTypeECDSA
 }
 
-func (signer ECDSASigner) verifier() SigVerifier {
+func (signer ECDSASigner) Verifier() SigVerifier {
 	return ECDSAVerifier{pubKey: &signer.signKey.PublicKey}
 }
 
@@ -149,23 +149,23 @@ type EDDSAVerifier struct {
 	pubKey ed25519.PublicKey
 }
 
-// verify checks a PureEdDSA (Ed25519) signature. Ed25519 hashes data itself,
+// Verify checks a PureEdDSA (Ed25519) signature. Ed25519 hashes data itself,
 // with SHA-512.
-func (v EDDSAVerifier) verify(data []byte, sig []byte) (bool, error) {
+func (v EDDSAVerifier) Verify(data []byte, sig []byte) (bool, error) {
 	if len(sig) != ed25519.SignatureSize {
 		return false, fmt.Errorf("wrong signature size: got %d bytes, want %d", len(sig), ed25519.SignatureSize)
 	}
 	return ed25519.Verify(v.pubKey, data, sig), nil
 }
 
-// hash is SHA-256, the hash the EdDSA cryptosuites apply to the canonical
+// Hash is SHA-256, the hash the EdDSA cryptosuites apply to the canonical
 // proof options and document.
-func (v EDDSAVerifier) hash(data []byte) []byte {
+func (v EDDSAVerifier) Hash(data []byte) []byte {
 	sum := sha256.Sum256(data)
 	return sum[:]
 }
 
-func (v EDDSAVerifier) sigType() SigType {
+func (v EDDSAVerifier) SigType() SigType {
 	return SigTypeEDDSA
 }
 

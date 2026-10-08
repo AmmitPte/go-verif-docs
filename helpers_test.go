@@ -86,7 +86,7 @@ func mustVerifier(t *testing.T, multikey string) SigVerifier {
 // requireSigVerifies fails the test unless sig is a valid signature over data.
 func requireSigVerifies(t *testing.T, verifier SigVerifier, data, sig []byte) {
 	t.Helper()
-	ok, err := verifier.verify(data, sig)
+	ok, err := verifier.Verify(data, sig)
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -95,10 +95,10 @@ func requireSigVerifies(t *testing.T, verifier SigVerifier, data, sig []byte) {
 	}
 }
 
-// requireSigRejected fails the test unless verify cleanly rejects sig over data.
+// requireSigRejected fails the test unless Verify cleanly rejects sig over data.
 func requireSigRejected(t *testing.T, verifier SigVerifier, data, sig []byte) {
 	t.Helper()
-	ok, err := verifier.verify(data, sig)
+	ok, err := verifier.Verify(data, sig)
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}

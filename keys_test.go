@@ -85,7 +85,7 @@ func TestVerifierFromMultikey_KnownSignatures(t *testing.T) {
 		t.Run(vec.name, func(t *testing.T) {
 			t.Parallel()
 			verifier, data, sig := vec.parse(t)
-			if got := verifier.sigType(); got != vec.sigType {
+			if got := verifier.SigType(); got != vec.sigType {
 				t.Errorf("sigType = %v, want %v", got, vec.sigType)
 			}
 			requireSigVerifies(t, verifier, data, sig)
@@ -101,7 +101,7 @@ func TestVerifier_WrongSignatureLength(t *testing.T) {
 			t.Parallel()
 			verifier, data, sig := vec.parse(t)
 			for _, bad := range [][]byte{nil, sig[:len(sig)-1], append(bytes.Clone(sig), 0x00)} {
-				ok, err := verifier.verify(data, bad)
+				ok, err := verifier.Verify(data, bad)
 				if ok {
 					t.Fatalf("verify accepted a %d-byte signature", len(bad))
 				}
@@ -115,7 +115,7 @@ func TestEDDSAVerifier_HashIsSHA256(t *testing.T) {
 	msg := []byte("canonical-bytes")
 	h := crypto.SHA256.New()
 	h.Write(msg)
-	if got, want := mustVerifier(t, vectorEd25519.publicKey).hash(msg), h.Sum(nil); !bytes.Equal(got, want) {
+	if got, want := mustVerifier(t, vectorEd25519.publicKey).Hash(msg), h.Sum(nil); !bytes.Equal(got, want) {
 		t.Errorf("hash = %x, want SHA-256 %x", got, want)
 	}
 }
@@ -250,25 +250,25 @@ func TestECDSASigner_SignsWithAllCurves(t *testing.T) {
 			if err != nil {
 				t.Fatalf("GenerateECDSASigner: %v", err)
 			}
-			if got := signer.sigType(); got != SigTypeECDSA {
+			if got := signer.SigType(); got != SigTypeECDSA {
 				t.Errorf("sigType = %v, want %v", got, SigTypeECDSA)
 			}
 
 			h := tt.hash.New()
 			h.Write(msg)
-			if got, want := signer.hash(msg), h.Sum(nil); !bytes.Equal(got, want) {
+			if got, want := signer.Hash(msg), h.Sum(nil); !bytes.Equal(got, want) {
 				t.Errorf("hash = %x, want %v %x", got, tt.hash, want)
 			}
 
-			sig, err := signer.sign(msg)
+			sig, err := signer.Sign(msg)
 			if err != nil {
 				t.Fatalf("sign: %v", err)
 			}
 			if len(sig) != tt.sigLen {
 				t.Fatalf("signature length = %d, want %d", len(sig), tt.sigLen)
 			}
-			requireSigVerifies(t, signer.verifier(), msg, sig)
-			requireSigRejected(t, signer.verifier(), flipBit(msg, 0), sig)
+			requireSigVerifies(t, signer.Verifier(), msg, sig)
+			requireSigRejected(t, signer.Verifier(), flipBit(msg, 0), sig)
 		})
 	}
 }
@@ -291,7 +291,7 @@ func TestECDSASigner_InvalidSigningKey(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			signer := ECDSASigner{signKey: *key}
 			signer.signKey.D = tt.d
-			sig, err := signer.sign([]byte("canonical-bytes"))
+			sig, err := signer.Sign([]byte("canonical-bytes"))
 			requireErrorContains(t, err, "private key scalar")
 			if sig != nil {
 				t.Errorf("signature = %x, want none", sig)
@@ -372,7 +372,7 @@ func TestVerifierFromJWK_KnownSignatures(t *testing.T) {
 			if err != nil {
 				t.Fatalf("VerifierFromJWK: %v", err)
 			}
-			if got := verifier.sigType(); got != vec.sigType {
+			if got := verifier.SigType(); got != vec.sigType {
 				t.Errorf("sigType = %v, want %v", got, vec.sigType)
 			}
 			if v, ok := verifier.(*ECDSAVerifier); ok {
@@ -548,7 +548,7 @@ func TestGetAssertionVerifier(t *testing.T) {
 			if err != nil {
 				t.Fatalf("GetAssertionVerifier: %v", err)
 			}
-			if got := verifier.sigType(); got != tt.wantType {
+			if got := verifier.SigType(); got != tt.wantType {
 				t.Errorf("sigType = %v, want %v", got, tt.wantType)
 			}
 			requireSigVerifies(t, verifier, tt.data, tt.sig)
@@ -681,7 +681,7 @@ func TestGetAssertionVerifier_FromFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAssertionVerifier: %v", err)
 	}
-	if got := verifier.sigType(); got != SigTypeECDSA {
+	if got := verifier.SigType(); got != SigTypeECDSA {
 		t.Errorf("sigType = %v, want %v", got, SigTypeECDSA)
 	}
 }

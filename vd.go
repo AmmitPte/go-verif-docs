@@ -361,14 +361,14 @@ func (d SignedDoc) VerifyAt(verifier SigVerifier, at time.Time) error {
 	if d.Body == nil {
 		return errors.New("empty document")
 	}
-	if !d.Proof.CryptoSuite.MatchesSigType(verifier.sigType()) {
-		return fmt.Errorf("verifier type %s does not match cryptosuite %s", verifier.sigType(), d.Proof.CryptoSuite)
+	if !d.Proof.CryptoSuite.MatchesSigType(verifier.SigType()) {
+		return fmt.Errorf("verifier type %s does not match cryptosuite %s", verifier.SigType(), d.Proof.CryptoSuite)
 	}
-	data, err := hashData(d.Proof.CryptoSuite, d.Body, d.RawProofOptions, verifier.hash)
+	data, err := hashData(d.Proof.CryptoSuite, d.Body, d.RawProofOptions, verifier.Hash)
 	if err != nil {
 		return fmt.Errorf("hashing document: %w", err)
 	}
-	ok, err := verifier.verify(data, d.Proof.ProofValue)
+	ok, err := verifier.Verify(data, d.Proof.ProofValue)
 	if err != nil {
 		// The signature is malformed, for example the wrong length.
 		return fmt.Errorf("%w: %w", ErrInvalidSignature, err)
@@ -395,8 +395,8 @@ func Sign(body any, opts ProofOptions, signer Signer) (SignedDoc, error) {
 	if signer == nil {
 		return SignedDoc{}, errors.New("no signer given")
 	}
-	if cs := opts.CryptoSuite; !cs.MatchesSigType(signer.sigType()) {
-		return SignedDoc{}, fmt.Errorf("signer type %s does not match cryptosuite %s", signer.sigType(), cs)
+	if cs := opts.CryptoSuite; !cs.MatchesSigType(signer.SigType()) {
+		return SignedDoc{}, fmt.Errorf("signer type %s does not match cryptosuite %s", signer.SigType(), cs)
 	}
 	proof := Proof{
 		ProofType:          proofType,
@@ -454,11 +454,11 @@ func Sign(body any, opts ProofOptions, signer Signer) (SignedDoc, error) {
 	if err != nil {
 		return SignedDoc{}, fmt.Errorf("encoding proof options: %w", err)
 	}
-	hashed, err := hashData(proof.CryptoSuite, unsignedBody, options, signer.hash)
+	hashed, err := hashData(proof.CryptoSuite, unsignedBody, options, signer.Hash)
 	if err != nil {
 		return SignedDoc{}, fmt.Errorf("hashing document: %w", err)
 	}
-	if proof.ProofValue, err = signer.sign(hashed); err != nil {
+	if proof.ProofValue, err = signer.Sign(hashed); err != nil {
 		return SignedDoc{}, fmt.Errorf("signing document: %w", err)
 	}
 
