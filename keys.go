@@ -45,6 +45,10 @@ type SigVerifier interface {
 	SigType() SigType
 	// Hash is the cryptosuite's hash function for this key.
 	Hash(data []byte) []byte
+	// ToMultikey returns the public key as a base58btc Multikey, the form
+	// used in a verification method's publicKeyMultibase. It returns "" if
+	// there is no key, or the key has no Multikey encoding.
+	ToMultikey() string
 }
 
 // Signer signs with one private key.
@@ -130,6 +134,22 @@ func (v ECDSAVerifier) Hash(data []byte) []byte {
 
 func (v ECDSAVerifier) SigType() SigType {
 	return SigTypeECDSA
+}
+
+// ToMultikey encodes the key as a compressed point after its curve's
+// multicodec. It returns "" for the zero value, and for a curve with no
+// Multikey codec, such as P-224.
+func (v ECDSAVerifier) ToMultikey() string {
+	if !v.hasKey() {
+		return ""
+	}
+	name := v.pubKey.Curve.Params().Name
+	for codec, curve := range multikeyCurves {
+		if curve.Params().Name == name {
+			return encodeMultikey(codec, elliptic.MarshalCompressed(curve, v.pubKey.X, v.pubKey.Y))
+		}
+	}
+	return ""
 }
 
 // ECDSASigner signs with an ECDSA private key. Make one with NewECDSASigner
@@ -230,6 +250,15 @@ func (v EDDSAVerifier) SigType() SigType {
 	return SigTypeEDDSA
 }
 
+// ToMultikey encodes the raw key after the ed25519-pub multicodec. It returns
+// "" for the zero value.
+func (v EDDSAVerifier) ToMultikey() string {
+	if len(v.pubKey) != ed25519.PublicKeySize {
+		return ""
+	}
+	return encodeMultikey(codecEd25519, v.pubKey)
+}
+
 // Public key multicodecs from the multiformats table. A Multikey is one of
 // these codecs as an unsigned varint, followed by the key bytes.
 const (
@@ -244,6 +273,14 @@ var multikeyCurves = map[uint64]elliptic.Curve{
 	codecP256: elliptic.P256(),
 	codecP384: elliptic.P384(),
 	codecP521: elliptic.P521(),
+}
+
+// encodeMultikey returns codec as an unsigned varint followed by key, encoded
+// as base58btc multibase.
+func encodeMultikey(codec uint64, key []byte) string {
+	// Encode fails only for an unknown encoding, and Base58BTC is known.
+	encoded, _ := multibase.Encode(multibase.Base58BTC, append(binary.AppendUvarint(nil, codec), key...))
+	return encoded
 }
 
 // VerifierFromMultikey returns a verifier for a Multikey-encoded public key,

@@ -60,15 +60,6 @@ var multikeyVectors = []keyVector{
 // does not support. The supported codecs are defined in keys.go.
 const codecX25519 = 0xec
 
-func encodeMultikey(t *testing.T, codec uint64, key []byte) string {
-	t.Helper()
-	encoded, err := multibase.Encode(multibase.Base58BTC, append(binary.AppendUvarint(nil, codec), key...))
-	if err != nil {
-		t.Fatalf("multibase.Encode: %v", err)
-	}
-	return encoded
-}
-
 // requireNoVerifier checks that making a verifier failed with an error
 // containing want. The verifier must be a nil interface: a nil pointer inside
 // a non-nil interface would pass a caller's nil check.
@@ -146,14 +137,14 @@ func TestEDDSAVerifier_RejectsOtherKeys(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			verifier := mustVerifier(t, encodeMultikey(t, codecEd25519, tt.key))
+			verifier := mustVerifier(t, encodeMultikey(codecEd25519, tt.key))
 			requireSigRejected(t, verifier, data, sig)
 		})
 	}
 }
 
 func TestVerifierFromMultikey_UnsupportedCodec(t *testing.T) {
-	verifier, err := VerifierFromMultikey(encodeMultikey(t, codecX25519, bytes.Repeat([]byte{0x11}, 32)))
+	verifier, err := VerifierFromMultikey(encodeMultikey(codecX25519, bytes.Repeat([]byte{0x11}, 32)))
 	requireNoVerifier(t, verifier, err, "unsupported multicodec 0xec")
 }
 
@@ -172,7 +163,7 @@ func TestVerifierFromMultikey_WrongKeyLength(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			for _, size := range []int{tt.keySize - 1, tt.keySize + 1} {
-				key := encodeMultikey(t, tt.codec, bytes.Repeat([]byte{0x02}, size))
+				key := encodeMultikey(tt.codec, bytes.Repeat([]byte{0x02}, size))
 				verifier, err := VerifierFromMultikey(key)
 				requireNoVerifier(t, verifier, err, "public key length")
 			}
@@ -197,7 +188,7 @@ func TestVerifierFromMultikey_InvalidCurvePoint(t *testing.T) {
 			point := make([]byte, tt.size)
 			point[0] = 0x02
 			point[len(point)-1] = 0x07
-			verifier, err := VerifierFromMultikey(encodeMultikey(t, tt.codec, point))
+			verifier, err := VerifierFromMultikey(encodeMultikey(tt.codec, point))
 			requireNoVerifier(t, verifier, err, "curve point")
 		})
 	}
@@ -228,6 +219,99 @@ func TestVerifierFromMultikey_InvalidPrefix(t *testing.T) {
 func TestVerifierFromMultikey_InvalidEncoding(t *testing.T) {
 	verifier, err := VerifierFromMultikey("not-a-multikey")
 	requireNoVerifier(t, verifier, err, "decoding multikey")
+}
+
+// --- Multikey encoding ---
+
+// ToMultikey must give back exactly the Multikey a verifier was made from.
+func TestToMultikey_RoundTripsVectors(t *testing.T) {
+	for _, vec := range multikeyVectors {
+		t.Run(vec.name, func(t *testing.T) {
+			t.Parallel()
+			if got := mustVerifier(t, vec.key).ToMultikey(); got != vec.key {
+				t.Errorf("ToMultikey = %q, want %q", got, vec.key)
+			}
+		})
+	}
+}
+
+// Each key type's codec gives its Multikeys a fixed base58btc prefix, as in
+// the W3C test vectors: zDn for P-256, z82 for P-384 and z6Mk for Ed25519.
+func TestToMultikey_Prefix(t *testing.T) {
+	tests := []struct {
+		vec    jwkVector
+		prefix string
+	}{
+		{vec: jwkP256, prefix: "zDn"},
+		{vec: jwkP384, prefix: "z82"},
+		{vec: jwkP521, prefix: "z2J9"},
+		{vec: jwkEd25519, prefix: "z6Mk"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.vec.name, func(t *testing.T) {
+			t.Parallel()
+			verifier, err := VerifierFromJWK(mustParseJWK(t, tt.vec.jwk))
+			if err != nil {
+				t.Fatalf("VerifierFromJWK: %v", err)
+			}
+			got := verifier.ToMultikey()
+			if !strings.HasPrefix(got, tt.prefix) {
+				t.Errorf("ToMultikey = %q, want prefix %q", got, tt.prefix)
+			}
+
+			// The Multikey must name the same key as the JWK.
+			fromMultikey := mustVerifier(t, got)
+			requireSigVerifies(t, fromMultikey, []byte(tt.vec.msg), mustDecodeHex(t, tt.vec.sig))
+		})
+	}
+}
+
+func TestToMultikey_GeneratedKeys(t *testing.T) {
+	msg := []byte("canonical-bytes")
+	for _, curve := range []elliptic.Curve{elliptic.P256(), elliptic.P384(), elliptic.P521()} {
+		t.Run(curve.Params().Name, func(t *testing.T) {
+			t.Parallel()
+			signer, err := GenerateECDSASigner(curve)
+			if err != nil {
+				t.Fatalf("GenerateECDSASigner: %v", err)
+			}
+			sig, err := signer.Sign(msg)
+			if err != nil {
+				t.Fatalf("sign: %v", err)
+			}
+			multikey := signer.Verifier().ToMultikey()
+			requireSigVerifies(t, mustVerifier(t, multikey), msg, sig)
+		})
+	}
+
+	t.Run("Ed25519", func(t *testing.T) {
+		t.Parallel()
+		pub, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("GenerateKey: %v", err)
+		}
+		verifier, err := EDDSAVerifierFromBytes(pub)
+		if err != nil {
+			t.Fatalf("EDDSAVerifierFromBytes: %v", err)
+		}
+		multikey := verifier.ToMultikey()
+		requireSigVerifies(t, mustVerifier(t, multikey), msg, ed25519.Sign(priv, msg))
+	})
+}
+
+// P-224 is valid for crypto/ecdsa but has no Multikey codec.
+func TestToMultikey_UnsupportedCurve(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P224(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	verifier, err := NewECDSAVerifier(&key.PublicKey)
+	if err != nil {
+		t.Fatalf("NewECDSAVerifier: %v", err)
+	}
+	if got := verifier.ToMultikey(); got != "" {
+		t.Errorf("ToMultikey = %q, want \"\"", got)
+	}
 }
 
 // --- ECDSA signer ---
@@ -403,6 +487,9 @@ func TestZeroValueKeys(t *testing.T) {
 				t.Error("verify accepted a signature with no key")
 			}
 			verifier.Hash(data)
+			if got := verifier.ToMultikey(); got != "" {
+				t.Errorf("ToMultikey = %q, want \"\"", got)
+			}
 
 			vd := vectorDoc(t, vectorP256)
 			if verifier.SigType() == SigTypeEDDSA {
